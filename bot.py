@@ -25,15 +25,14 @@ EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале перед 
 
 # Ищем Node.js автоматически (помогает yt-dlp работать быстрее)
 import shutil
-_node = shutil.which("node") or shutil.which("nodejs")
-_JS_RUNTIME = f"nodejs:{_node}" if _node else None
 
 def _base_opts(extra: dict = {}) -> dict:
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
-        "cookiefile": "cookies.txt",
+        "cookiefile": "/app/cookies.txt",
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     opts.update(extra)
     return opts

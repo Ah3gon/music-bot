@@ -5,7 +5,6 @@ import yt_dlp
 import asyncio
 import random
 import os          # ← добавь эту строку
-import shutil
 from collections import deque
 from typing import Optional
 from dotenv import load_dotenv
@@ -23,20 +22,22 @@ EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале перед 
 #  yt-dlp
 # ─────────────────────────────────────────────
 
-def _base_opts(extra: dict = {}) -> dict:
-    opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "cookiefile": "/app/cookies.txt",
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-        "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip"},
-    }
-    opts.update(extra)
-    return opts
+YTDL_SEARCH_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "cookiefile": "/app/cookies.txt",
+    "extract_flat": "in_playlist",
+}
 
-YTDL_SEARCH_OPTS = _base_opts({"extract_flat": "in_playlist"})
-YTDL_STREAM_OPTS = _base_opts()
+YTDL_STREAM_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "cookiefile": "/app/cookies.txt",
+    "extractor_args": {"youtube": {"player_client": ["android"]}},
+    "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip"},
+}
 
 # ─────────────────────────────────────────────
 #  Бот

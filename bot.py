@@ -28,7 +28,8 @@ def _base_opts(extra: dict = {}) -> dict:
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "cookiefile": "/app/cookies.txt",
+        "extractor_args": {"youtube": {"player_client": ["mweb"]}},
     }
     opts.update(extra)
     return opts

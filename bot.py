@@ -33,6 +33,7 @@ def _base_opts(extra: dict = {}) -> dict:
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
+        "cookiefile": "cookies.txt",
         "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
     }
     opts.update(extra)

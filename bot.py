@@ -24,13 +24,16 @@ EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале перед 
 # ─────────────────────────────────────────────
 
 def _base_opts(extra: dict = {}) -> dict:
+    import shutil
+    node_path = shutil.which("node")
     opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "cookiefile": "/app/cookies.txt",
-        "extractor_args": {"youtube": {"player_client": ["web_embedded"]}},
     }
+    if node_path:
+        opts["js_runtimes"] = {"node": {"path": node_path}}
     opts.update(extra)
     return opts
 

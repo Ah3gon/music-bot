@@ -67,6 +67,50 @@ def cancel_idle_timer(guild_id: int):
         del idle_tasks[guild_id]
 
 
+class QueueModal(discord.ui.Modal, title="Очередь треков"):
+    count = discord.ui.TextInput(
+        label="Сколько треков показать?",
+        placeholder="Оставь пустым чтобы показать все",
+        required=False,
+        max_length=3,
+    )
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        player: wavelink.Player = self.guild.voice_client
+        if not player or (not player.current and player.queue.is_empty):
+            await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
+            return
+
+        # Определяем сколько треков показать
+        try:
+            limit = int(self.count.value) if self.count.value.strip() else None
+        except ValueError:
+            await interaction.response.send_message("❗ Введи число.", ephemeral=True)
+            return
+
+        lines = []
+        if player.current:
+            t = player.current
+            link = f" — [открыть]({t.uri})" if t.uri else ""
+            lines.append(f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n")
+
+        if not player.queue.is_empty:
+            queue_list = list(player.queue)
+            total = len(queue_list)
+            shown = queue_list[:limit] if limit else queue_list[:20]
+            lines.append("**В очереди:**")
+            for i, t in enumerate(shown, 1):
+                lines.append(f"`{i}.` 🎵 {t.title} `[{format_duration(t.length)}]`")
+            if limit and total > limit:
+                lines.append(f"_...и ещё {total - limit} треков_")
+            elif not limit and total > 20:
+                lines.append(f"_...и ещё {total - 20} треков (уточни число для просмотра)_")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 # ─────────────────────────────────────────────
 #  Кнопки управления под "Сейчас играет"
 # ─────────────────────────────────────────────
@@ -127,6 +171,10 @@ class PlayerControls(discord.ui.View):
             await interaction.response.send_message("🔀 Очередь перемешана.", ephemeral=True)
         else:
             await interaction.response.send_message("❗ Нечего перемешивать.", ephemeral=True)
+
+    @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, row=0)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(QueueModal(self.guild))
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=0)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):

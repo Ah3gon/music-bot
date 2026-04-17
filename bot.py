@@ -21,7 +21,6 @@ EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале
 NODES = [
     {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
     {"uri": "http://n3.nexcloud.in:2026",       "password": "nexcloud"},
-    {"uri": "http://lava.g3v.co.uk:9008",       "password": "lavalinklol"},
 ]
 
 # ─────────────────────────────────────────────
@@ -246,10 +245,11 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
 
-    # Если очередь пуста — запускаем idle-таймер
-    if player.queue.is_empty and not player.playing:
-        if channel:
-            await start_idle_timer(guild, channel)
+    if not player.queue.is_empty:
+        next_track = player.queue.get()
+        await player.play(next_track)
+    elif channel:
+        await start_idle_timer(guild, channel)
 
 
 @bot.event

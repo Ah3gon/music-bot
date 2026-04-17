@@ -176,6 +176,7 @@ class TrackSelectView(discord.ui.View):
                 await player.move_to(self.voice_channel)
 
             player.autoplay = wavelink.AutoPlayMode.disabled
+            player._text_channel_id = self.text_channel.id
 
             if not player.playing:
                 await self.search_msg.delete()

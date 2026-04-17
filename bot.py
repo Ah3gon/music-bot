@@ -245,6 +245,15 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
 
+    # Повтор трека
+    if player.queue.mode == wavelink.QueueMode.loop:
+        await player.play(payload.track)
+        return
+
+    # Повтор очереди — кладём трек обратно в конец
+    if player.queue.mode == wavelink.QueueMode.loop_all:
+        await player.queue.put_wait(payload.track)
+
     if not player.queue.is_empty:
         next_track = player.queue.get()
         await player.play(next_track)

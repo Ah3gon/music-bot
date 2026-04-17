@@ -34,8 +34,8 @@ YTDL_STREAM_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "extractor_args": {"youtube": {"player_client": ["android"]}},
-    "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12) gzip"},
+    "cookiefile": "/app/cookies.txt",
+    "extractor_args": {"youtube": {"player_client": ["web_creator"]}},
 }
 
 # ─────────────────────────────────────────────

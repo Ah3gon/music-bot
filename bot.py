@@ -17,7 +17,6 @@ DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 IDLE_TIMEOUT     = 300   # секунд тишины перед автовыходом
 EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале
 
-# Публичные Lavalink-ноды (используются по порядку, если одна упала)
 NODES = [
     {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
     {"uri": "http://n3.nexcloud.in:2026",       "password": "nexcloud"},
@@ -33,7 +32,6 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-# idle-таймеры на каждый сервер
 idle_tasks: dict[int, asyncio.Task] = {}
 
 
@@ -54,8 +52,10 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
     async def _timer():
         await asyncio.sleep(IDLE_TIMEOUT)
         player: wavelink.Player = guild.voice_client
+        # Исправлен баг: не выходим если трек на паузе
         if player and not player.playing and not player.paused:
             await player.disconnect()
+            idle_tasks.pop(guild.id, None)
             await channel.send(f"💤 Вышел — {IDLE_TIMEOUT // 60} мин тишины.")
 
     idle_tasks[guild.id] = asyncio.create_task(_timer())
@@ -67,6 +67,9 @@ def cancel_idle_timer(guild_id: int):
         del idle_tasks[guild_id]
 
 
+# ─────────────────────────────────────────────
+#  Модальное окно очереди
+# ─────────────────────────────────────────────
 class QueueModal(discord.ui.Modal, title="Очередь треков"):
     count = discord.ui.TextInput(
         label="Сколько треков показать?",
@@ -85,7 +88,6 @@ class QueueModal(discord.ui.Modal, title="Очередь треков"):
             await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
             return
 
-        # Определяем сколько треков показать
         try:
             limit = int(self.count.value) if self.count.value.strip() else None
         except ValueError:
@@ -111,6 +113,8 @@ class QueueModal(discord.ui.Modal, title="Очередь треков"):
                 lines.append(f"_...и ещё {total - 20} треков (уточни число для просмотра)_")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
 # ─────────────────────────────────────────────
 #  Кнопки управления под "Сейчас играет"
 # ─────────────────────────────────────────────
@@ -181,6 +185,7 @@ class PlayerControls(discord.ui.View):
         p = self.player
         if p:
             p.queue.clear()
+            cancel_idle_timer(self.guild.id)  # Исправлен баг: чистим таймер
             await p.stop()
             await p.disconnect()
         await interaction.response.send_message("⏹ Остановлено.", ephemeral=True)
@@ -215,7 +220,6 @@ class TrackSelectView(discord.ui.View):
             await interaction.response.defer()
             track = self.tracks[index]
 
-            # Подключаемся к голосовому каналу
             player: wavelink.Player = self.guild.voice_client
             if player is None:
                 player = await self.voice_channel.connect(cls=wavelink.Player)
@@ -228,7 +232,6 @@ class TrackSelectView(discord.ui.View):
             if not player.playing:
                 await self.search_msg.delete()
                 await player.play(track)
-                # Сообщение "Сейчас играет" появится через on_wavelink_track_start
             else:
                 await player.queue.put_wait(track)
                 await self.search_msg.edit(
@@ -255,13 +258,11 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     track = payload.track
     guild = player.guild
 
-    # Ищем текстовый канал (сохранён в player.extras)
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
     if not channel:
         return
 
-    # Удаляем предыдущее "Сейчас играет"
     msg_id = getattr(player, "_now_playing_msg_id", None)
     if msg_id:
         try:
@@ -293,12 +294,10 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
 
-    # Повтор трека
     if player.queue.mode == wavelink.QueueMode.loop:
         await player.play(payload.track)
         return
 
-    # Повтор очереди — кладём трек обратно в конец
     if player.queue.mode == wavelink.QueueMode.loop_all:
         await player.queue.put_wait(payload.track)
 
@@ -311,6 +310,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
 @bot.event
 async def on_wavelink_inactive_player(player: wavelink.Player):
+    cancel_idle_timer(player.guild.id)
     await player.disconnect()
 
 
@@ -327,8 +327,6 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         return
 
     msg = await interaction.followup.send(f"🔍 Ищу **{query}**...", wait=True)
-
-    # Поиск через Lavalink
     results = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
 
     if not results:
@@ -345,7 +343,6 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                            interaction.user.voice.channel,
                            interaction.channel, msg)
 
-    # Запоминаем текстовый канал в плеере
     player: wavelink.Player = interaction.guild.voice_client
     if player:
         player._text_channel_id = interaction.channel.id
@@ -374,7 +371,6 @@ async def skipto_cmd(interaction: discord.Interaction, position: int):
     if position < 1 or position > len(q):
         await interaction.response.send_message(f"❗ Укажи номер от 1 до {len(q)}.")
         return
-    # Удаляем треки перед нужным
     for _ in range(position - 1):
         q.get()
     await player.skip(force=True)
@@ -399,6 +395,7 @@ async def stop_cmd(interaction: discord.Interaction):
     player: wavelink.Player = interaction.guild.voice_client
     if player:
         player.queue.clear()
+        cancel_idle_timer(interaction.guild_id)  # Исправлен баг: чистим таймер
         await player.stop()
         await player.disconnect()
         await interaction.response.send_message("⏹ Остановлено.")
@@ -509,9 +506,16 @@ async def on_voice_state_update(member: discord.Member,
                                 after: discord.VoiceState):
     if member.bot:
         return
+
     player: wavelink.Player = member.guild.voice_client
     if not player:
         return
+
+    # Исправлен баг: кто-то зашёл обратно — отменяем таймер выхода
+    if after.channel and after.channel == player.channel:
+        cancel_idle_timer(member.guild.id)
+        return
+
     non_bots = [m for m in player.channel.members if not m.bot]
     if len(non_bots) == 0:
         await asyncio.sleep(EMPTY_CH_TIMEOUT)
@@ -519,6 +523,7 @@ async def on_voice_state_update(member: discord.Member,
             non_bots = [m for m in player.channel.members if not m.bot]
             if len(non_bots) == 0:
                 channel_id = getattr(player, "_text_channel_id", None)
+                cancel_idle_timer(member.guild.id)
                 await player.disconnect()
                 if channel_id:
                     channel = member.guild.get_channel(channel_id)
@@ -532,11 +537,8 @@ async def on_voice_state_update(member: discord.Member,
 @bot.event
 async def on_ready():
     print(f"✅ Бот запущен как {bot.user}")
-
-    # Подключаем Lavalink-ноды
     nodes = [wavelink.Node(**n) for n in NODES]
     await wavelink.Pool.connect(nodes=nodes, client=bot)
-
     await tree.sync()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening, name="/play"

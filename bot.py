@@ -98,7 +98,7 @@ class PlayerControls(discord.ui.View):
         p = self.player
         if p and (p.playing or p.paused):
             await p.skip(force=True)
-            await interaction.response.send_message("⏭ Пропущено.", ephemeral=True)
+            await interaction.response.defer()
         else:
             await interaction.response.defer()
 
@@ -301,7 +301,7 @@ async def skip_cmd(interaction: discord.Interaction):
     player: wavelink.Player = interaction.guild.voice_client
     if player and (player.playing or player.paused):
         await player.skip(force=True)
-        await interaction.response.send_message("⏭ Пропущено.")
+        await interaction.response.defer()
     else:
         await interaction.response.send_message("❗ Ничего не играет.")
 

@@ -54,7 +54,7 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
     async def _timer():
         await asyncio.sleep(IDLE_TIMEOUT)
         player: wavelink.Player = guild.voice_client
-        if player and not player.playing:
+        if player and not player.playing and not player.paused:
             await player.disconnect()
             await channel.send(f"💤 Вышел — {IDLE_TIMEOUT // 60} мин тишины.")
 

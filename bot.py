@@ -180,7 +180,7 @@ class PlayerControls(discord.ui.View):
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(QueueModal(self.guild))
 
-    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.player
         if p:

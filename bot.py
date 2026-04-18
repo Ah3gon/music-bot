@@ -996,6 +996,59 @@ async def pl_tracks(interaction: discord.Interaction, name: str):
 tree.add_command(playlist_group)
 
 
+@tree.command(name="help", description="Список всех команд бота")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎵 Music Bot — Команды",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(name="▶️ Воспроизведение", value=
+        "`/play <запрос>` — поиск на YouTube или SoundCloud\n"
+        "`/spotify <ссылка>` — добавить трек/альбом/плейлист из Spotify\n"
+        "`/skip` — пропустить трек\n"
+        "`/skipto <номер>` — перейти к треку в очереди\n"
+        "`/pause` — пауза / продолжить\n"
+        "`/stop` — остановить и выйти из канала",
+        inline=False
+    )
+
+    embed.add_field(name="🎛️ Настройки", value=
+        "`/volume <0-100>` — громкость\n"
+        "`/loop` — режим повтора (выкл / трек / очередь)\n"
+        "`/shuffle` — перемешать очередь",
+        inline=False
+    )
+
+    embed.add_field(name="📋 Очередь", value=
+        "`/queue` — показать очередь\n"
+        "`/nowplaying` — текущий трек\n"
+        "`/remove <номер>` — убрать трек из очереди\n"
+        "`/savequeue <название>` — сохранить очередь как плейлист",
+        inline=False
+    )
+
+    embed.add_field(name="💾 Плейлисты", value=
+        "`/playlist create <название>` — создать плейлист\n"
+        "`/playlist list` — твои плейлисты\n"
+        "`/playlist play <название>` — воспроизвести плейлист\n"
+        "`/playlist tracks <название>` — треки в плейлисте\n"
+        "`/playlist addtrack <название>` — добавить текущий трек\n"
+        "`/playlist record <название>` — начать/остановить запись\n"
+        "`/playlist delete <название>` — удалить плейлист",
+        inline=False
+    )
+
+    embed.add_field(name="🎮 Кнопки на панели", value=
+        "⏸ пауза/продолжить  ⏭ пропустить  🔁 повтор\n"
+        "🔀 перемешать  📋 очередь  💾 в плейлист  ⏹ стоп",
+        inline=False
+    )
+
+    embed.set_footer(text="Подсказка: используй /play с выбором платформы для SoundCloud!")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ─────────────────────────────────────────────
 #  Автовыход из пустого канала
 # ─────────────────────────────────────────────

@@ -24,7 +24,9 @@ SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 IDLE_TIMEOUT          = 300
 EMPTY_CH_TIMEOUT      = 60
-SPOTIFY_TRACK_LIMIT   = 50   # максимум треков из Spotify плейлиста/альбома
+SPOTIFY_TRACK_LIMIT   = 50
+BOT_NAME              = "Surge"
+BIRTHDAY_SONG_QUERY   = "Happy Birthday to You instrumental"
 
 NODES = [
     {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
@@ -43,9 +45,7 @@ tree = bot.tree
 
 idle_tasks: dict[int, asyncio.Task] = {}
 db_pool: Optional[asyncpg.Pool] = None
-# recording_sessions: guild_id -> {user_id, playlist_id, playlist_name}
 recording_sessions: dict[int, dict] = {}
-# Кэш Spotify токена
 _spotify_token: Optional[str] = None
 _spotify_token_expires: float = 0.0
 
@@ -74,6 +74,13 @@ async def init_db():
                 uri         TEXT    NOT NULL,
                 duration    INTEGER NOT NULL,
                 position    INTEGER NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS birthdays (
+                user_id    BIGINT PRIMARY KEY,
+                birth_day  INTEGER NOT NULL,
+                birth_month INTEGER NOT NULL
             )
         """)
 
@@ -139,13 +146,21 @@ async def db_get_tracks(playlist_id: int) -> list:
         return [dict(r) for r in rows]
 
 
-async def db_remove_track(playlist_id: int, position: int) -> bool:
+async def db_set_birthday(user_id: int, day: int, month: int):
     async with db_pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND position=$2",
-            playlist_id, position
+        await conn.execute(
+            "INSERT INTO birthdays (user_id, birth_day, birth_month) VALUES ($1,$2,$3) "
+            "ON CONFLICT (user_id) DO UPDATE SET birth_day=$2, birth_month=$3",
+            user_id, day, month
         )
-        return result != "DELETE 0"
+
+
+async def db_get_birthday(user_id: int) -> Optional[dict]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM birthdays WHERE user_id=$1", user_id
+        )
+        return dict(row) if row else None
 
 
 # ─────────────────────────────────────────────
@@ -185,7 +200,6 @@ def parse_spotify_url(url: str) -> Optional[tuple]:
 
 
 async def fetch_spotify_tracks(url: str) -> Optional[list]:
-    """Возвращает список {title, artist} или None."""
     parsed = parse_spotify_url(url)
     if not parsed:
         return None
@@ -239,6 +253,16 @@ def format_duration(ms: int) -> str:
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
+def make_progress_bar(position_ms: int, length_ms: int, bar_len: int = 15) -> str:
+    """Статичная шкала прогресса на момент начала трека."""
+    if length_ms == 0:
+        return "▬" * bar_len
+    progress = position_ms / length_ms
+    filled = int(progress * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    return f"{bar} {format_duration(position_ms)} / {format_duration(length_ms)}"
+
+
 async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
     if guild.id in idle_tasks:
         idle_tasks[guild.id].cancel()
@@ -258,6 +282,12 @@ def cancel_idle_timer(guild_id: int):
     if guild_id in idle_tasks:
         idle_tasks[guild_id].cancel()
         del idle_tasks[guild_id]
+
+
+def is_birthday_today(day: int, month: int) -> bool:
+    import datetime
+    today = datetime.date.today()
+    return today.day == day and today.month == month
 
 
 # ─────────────────────────────────────────────
@@ -399,6 +429,26 @@ class PlayerControls(discord.ui.View):
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(QueueModal(self.guild))
 
+    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.player
+        if not p:
+            await interaction.response.defer()
+            return
+        new_vol = max(0, p.volume - 10)
+        await p.set_volume(new_vol)
+        await interaction.response.send_message(f"🔉 Громкость: **{new_vol}%**", ephemeral=True)
+
+    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
+    async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = self.player
+        if not p:
+            await interaction.response.defer()
+            return
+        new_vol = min(100, p.volume + 10)
+        await p.set_volume(new_vol)
+        await interaction.response.send_message(f"🔊 Громкость: **{new_vol}%**", ephemeral=True)
+
     @discord.ui.button(emoji="💾", style=discord.ButtonStyle.secondary, row=1)
     async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AddToPlaylistModal(self.guild))
@@ -475,7 +525,6 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     track = payload.track
     guild = player.guild
 
-    # Запись в плейлист
     if guild.id in recording_sessions:
         session = recording_sessions[guild.id]
         await db_add_track(session["playlist_id"], track.title, track.uri, track.length)
@@ -500,13 +549,15 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     }
     recording_indicator = ""
     if guild.id in recording_sessions:
-        recording_indicator = f" | 🔴 Запись: **{recording_sessions[guild.id]['playlist_name']}**"
+        recording_indicator = f"\n🔴 Запись в: **{recording_sessions[guild.id]['playlist_name']}**"
 
     link = f" — [открыть]({track.uri})" if track.uri else ""
+    progress = make_progress_bar(0, track.length)
     text = (
-        f"🎵 **Сейчас играет:** {track.title} "
-        f"`[{format_duration(track.length)}]`{link}\n"
-        f"Повтор: **{loop_labels[player.queue.mode]}**{recording_indicator}"
+        f"🎵 **Сейчас играет:** {track.title}{link}\n"
+        f"`{progress}`\n"
+        f"Повтор: **{loop_labels[player.queue.mode]}** | 🔊 **{player.volume}%**"
+        f"{recording_indicator}"
     )
     msg = await channel.send(text, view=PlayerControls(guild))
     player._now_playing_msg_id = msg.id
@@ -537,6 +588,74 @@ async def on_wavelink_inactive_player(player: wavelink.Player):
 
 
 # ─────────────────────────────────────────────
+#  День рождения — автовход в войс
+# ─────────────────────────────────────────────
+@bot.event
+async def on_voice_state_update(member: discord.Member,
+                                before: discord.VoiceState,
+                                after: discord.VoiceState):
+    if member.bot:
+        return
+
+    # Проверяем день рождения при входе в канал
+    if after.channel and not before.channel and db_pool:
+        birthday = await db_get_birthday(member.id)
+        if birthday and is_birthday_today(birthday["birth_day"], birthday["birth_month"]):
+            player: wavelink.Player = member.guild.voice_client
+            if player is None or not player.is_connected():
+                try:
+                    player = await after.channel.connect(cls=wavelink.Player)
+                    player.autoplay = wavelink.AutoPlayMode.disabled
+
+                    # Ищем поздравительную музыку
+                    results = await wavelink.Playable.search(
+                        BIRTHDAY_SONG_QUERY, source=wavelink.TrackSource.YouTube
+                    )
+                    if results:
+                        track = results[0] if isinstance(results, list) else results.tracks[0]
+                        await player.play(track)
+
+                        # Находим текстовый канал
+                        text_channel = member.guild.system_channel
+                        if not text_channel:
+                            for ch in member.guild.text_channels:
+                                if ch.permissions_for(member.guild.me).send_messages:
+                                    text_channel = ch
+                                    break
+                        if text_channel:
+                            player._text_channel_id = text_channel.id
+                            await text_channel.send(
+                                f"🎂 С Днём рождения, {member.mention}! "
+                                f"🎉 Surge поздравляет тебя!"
+                            )
+                except Exception as e:
+                    print(f"[!] Ошибка поздравления: {e}")
+            return
+
+    player: wavelink.Player = member.guild.voice_client
+    if not player:
+        return
+
+    if after.channel and after.channel == player.channel:
+        cancel_idle_timer(member.guild.id)
+        return
+
+    non_bots = [m for m in player.channel.members if not m.bot]
+    if len(non_bots) == 0:
+        await asyncio.sleep(EMPTY_CH_TIMEOUT)
+        if player.is_connected():
+            non_bots = [m for m in player.channel.members if not m.bot]
+            if len(non_bots) == 0:
+                channel_id = getattr(player, "_text_channel_id", None)
+                cancel_idle_timer(member.guild.id)
+                await player.disconnect()
+                if channel_id:
+                    channel = member.guild.get_channel(channel_id)
+                    if channel:
+                        await channel.send("👋 Все ушли — выхожу из канала.")
+
+
+# ─────────────────────────────────────────────
 #  Slash-команды: воспроизведение
 # ─────────────────────────────────────────────
 PLATFORM_CHOICES = [
@@ -556,7 +675,6 @@ async def play_cmd(interaction: discord.Interaction, query: str,
         return
 
     msg = await interaction.followup.send(f"🔍 Ищу **{query}**...", wait=True)
-
     source = wavelink.TrackSource.SoundCloud if (platform and platform.value == "sc") \
         else wavelink.TrackSource.YouTube
     results = await wavelink.Playable.search(query, source=source)
@@ -574,7 +692,6 @@ async def play_cmd(interaction: discord.Interaction, query: str,
     player._text_channel_id = interaction.channel.id
     cancel_idle_timer(interaction.guild_id)
 
-    # Плейлист
     if isinstance(results, wavelink.Playlist):
         for track in results.tracks:
             await player.queue.put_wait(track)
@@ -588,7 +705,6 @@ async def play_cmd(interaction: discord.Interaction, query: str,
             )
         return
 
-    # Одиночная ссылка
     if query.startswith("http") and len(results) == 1:
         track = results[0]
         await player.queue.put_wait(track)
@@ -602,7 +718,6 @@ async def play_cmd(interaction: discord.Interaction, query: str,
             )
         return
 
-    # Обычный поиск
     tracks = results[:5]
     lines = ["**Результаты поиска:**\n"]
     for i, t in enumerate(tracks, 1):
@@ -621,9 +736,7 @@ async def spotify_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
         return
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        await interaction.followup.send(
-            "❗ Spotify не настроен. Добавь `SPOTIFY_CLIENT_ID` и `SPOTIFY_CLIENT_SECRET` в Variables на Railway."
-        )
+        await interaction.followup.send("❗ Spotify не настроен.")
         return
 
     msg = await interaction.followup.send("🎵 Получаю треки из Spotify...", wait=True)
@@ -681,7 +794,7 @@ async def savequeue_cmd(interaction: discord.Interaction, name: str):
     for t in tracks:
         await db_add_track(playlist_id, t.title, t.uri, t.length)
     await interaction.followup.send(
-        f"✅ Очередь сохранена как плейлист **{name}** — `{len(tracks)} треков`!"
+        f"✅ Очередь сохранена как **{name}** — `{len(tracks)} треков`!"
     )
 
 
@@ -827,8 +940,9 @@ async def np_cmd(interaction: discord.Interaction):
         return
     t = player.current
     link = f" — [открыть]({t.uri})" if t.uri else ""
+    progress = make_progress_bar(player.position, t.length)
     await interaction.response.send_message(
-        f"🎵 **Сейчас играет:** {t.title} `[{format_duration(t.length)}]`{link}"
+        f"🎵 **{t.title}**{link}\n`{progress}`"
     )
 
 
@@ -905,13 +1019,12 @@ async def pl_play(interaction: discord.Interaction, name: str):
         await msg.delete()
         await player.play(player.queue.get())
     else:
-        await msg.edit(content=f"📋 Плейлист **{name}** добавлен в очередь — `{added} треков`")
+        await msg.edit(content=f"📋 Плейлист **{name}** добавлен — `{added} треков`")
 
 
 @playlist_group.command(name="delete", description="Удалить плейлист")
 @app_commands.describe(name="Название плейлиста")
 async def pl_delete(interaction: discord.Interaction, name: str):
-    # Останавливаем запись если нужно
     rec = recording_sessions.get(interaction.guild_id, {})
     if rec.get("playlist_name") == name.strip():
         recording_sessions.pop(interaction.guild_id, None)
@@ -929,7 +1042,7 @@ async def pl_record(interaction: discord.Interaction, name: Optional[str] = None
     if guild_id in recording_sessions:
         session = recording_sessions.pop(guild_id)
         await interaction.response.send_message(
-            f"⏹ Запись в плейлист **{session['playlist_name']}** остановлена.", ephemeral=True
+            f"⏹ Запись в **{session['playlist_name']}** остановлена.", ephemeral=True
         )
         return
     if not name:
@@ -950,7 +1063,8 @@ async def pl_record(interaction: discord.Interaction, name: Optional[str] = None
         "playlist_name": name.strip(),
     }
     await interaction.response.send_message(
-        f"🔴 Запись в **{name}** начата — все треки которые будут играть добавятся автоматически.\n"
+        f"🔴 Запись в **{name}** начата!\n"
+        f"Все треки которые будут играть добавятся автоматически.\n"
         f"Чтобы остановить — `/playlist record` без аргументов.",
         ephemeral=True,
     )
@@ -996,13 +1110,48 @@ async def pl_tracks(interaction: discord.Interaction, name: str):
 tree.add_command(playlist_group)
 
 
+# ─────────────────────────────────────────────
+#  Slash-команды: день рождения
+# ─────────────────────────────────────────────
+birthday_group = app_commands.Group(name="birthday", description="Настройка дня рождения")
+
+
+@birthday_group.command(name="set", description="Установить свой день рождения")
+@app_commands.describe(day="День (1-31)", month="Месяц (1-12)")
+async def birthday_set(interaction: discord.Interaction, day: int, month: int):
+    if not (1 <= day <= 31) or not (1 <= month <= 12):
+        await interaction.response.send_message("❗ Неверная дата.", ephemeral=True)
+        return
+    await db_set_birthday(interaction.user.id, day, month)
+    month_names = ["января","февраля","марта","апреля","мая","июня",
+                   "июля","августа","сентября","октября","ноября","декабря"]
+    await interaction.response.send_message(
+        f"🎂 День рождения сохранён: **{day} {month_names[month-1]}**!\n"
+        f"Surge поздравит тебя когда ты зайдёшь в войс в этот день 🎉",
+        ephemeral=True
+    )
+
+
+@birthday_group.command(name="remove", description="Удалить свой день рождения")
+async def birthday_remove(interaction: discord.Interaction):
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM birthdays WHERE user_id=$1", interaction.user.id)
+    await interaction.response.send_message("✅ День рождения удалён.", ephemeral=True)
+
+
+tree.add_command(birthday_group)
+
+
+# ─────────────────────────────────────────────
+#  Help
+# ─────────────────────────────────────────────
 @tree.command(name="help", description="Список всех команд бота")
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🎵 Music Bot — Команды",
+        title=f"🎵 {BOT_NAME} — Команды",
         color=discord.Color.blurple()
     )
-
     embed.add_field(name="▶️ Воспроизведение", value=
         "`/play <запрос>` — поиск на YouTube или SoundCloud\n"
         "`/spotify <ссылка>` — добавить трек/альбом/плейлист из Spotify\n"
@@ -1012,22 +1161,19 @@ async def help_cmd(interaction: discord.Interaction):
         "`/stop` — остановить и выйти из канала",
         inline=False
     )
-
     embed.add_field(name="🎛️ Настройки", value=
         "`/volume <0-100>` — громкость\n"
         "`/loop` — режим повтора (выкл / трек / очередь)\n"
         "`/shuffle` — перемешать очередь",
         inline=False
     )
-
     embed.add_field(name="📋 Очередь", value=
         "`/queue` — показать очередь\n"
-        "`/nowplaying` — текущий трек\n"
+        "`/nowplaying` — текущий трек с прогрессом\n"
         "`/remove <номер>` — убрать трек из очереди\n"
         "`/savequeue <название>` — сохранить очередь как плейлист",
         inline=False
     )
-
     embed.add_field(name="💾 Плейлисты", value=
         "`/playlist create <название>` — создать плейлист\n"
         "`/playlist list` — твои плейлисты\n"
@@ -1038,45 +1184,20 @@ async def help_cmd(interaction: discord.Interaction):
         "`/playlist delete <название>` — удалить плейлист",
         inline=False
     )
-
-    embed.add_field(name="🎮 Кнопки на панели", value=
-        "⏸ пауза/продолжить  ⏭ пропустить  🔁 повтор\n"
-        "🔀 перемешать  📋 очередь  💾 в плейлист  ⏹ стоп",
+    embed.add_field(name="🎂 День рождения", value=
+        "`/birthday set <день> <месяц>` — установить дату\n"
+        "`/birthday remove` — удалить дату\n"
+        f"_{BOT_NAME} поздравит тебя музыкой когда зайдёшь в войс!_",
         inline=False
     )
-
-    embed.set_footer(text="Подсказка: используй /play с выбором платформы для SoundCloud!")
+    embed.add_field(name="🎮 Кнопки на панели", value=
+        "⏸ пауза/продолжить  ⏭ пропустить  🔁 повтор\n"
+        "🔀 перемешать  📋 очередь  🔉 громкость−  🔊 громкость+\n"
+        "💾 в плейлист  ⏹ стоп",
+        inline=False
+    )
+    embed.set_footer(text=f"{BOT_NAME} • /play с выбором платформы для SoundCloud")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ─────────────────────────────────────────────
-#  Автовыход из пустого канала
-# ─────────────────────────────────────────────
-@bot.event
-async def on_voice_state_update(member: discord.Member,
-                                before: discord.VoiceState,
-                                after: discord.VoiceState):
-    if member.bot:
-        return
-    player: wavelink.Player = member.guild.voice_client
-    if not player:
-        return
-    if after.channel and after.channel == player.channel:
-        cancel_idle_timer(member.guild.id)
-        return
-    non_bots = [m for m in player.channel.members if not m.bot]
-    if len(non_bots) == 0:
-        await asyncio.sleep(EMPTY_CH_TIMEOUT)
-        if player.is_connected():
-            non_bots = [m for m in player.channel.members if not m.bot]
-            if len(non_bots) == 0:
-                channel_id = getattr(player, "_text_channel_id", None)
-                cancel_idle_timer(member.guild.id)
-                await player.disconnect()
-                if channel_id:
-                    channel = member.guild.get_channel(channel_id)
-                    if channel:
-                        await channel.send("👋 Все ушли — выхожу из канала.")
 
 
 # ─────────────────────────────────────────────
@@ -1084,12 +1205,12 @@ async def on_voice_state_update(member: discord.Member,
 # ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"✅ Бот запущен как {bot.user}")
+    print(f"✅ {BOT_NAME} запущен как {bot.user}")
     if DATABASE_URL:
         await init_db()
         print("✅ База данных подключена")
     else:
-        print("⚠️ DATABASE_URL не задан — плейлисты недоступны")
+        print("⚠️ DATABASE_URL не задан — плейлисты и дни рождения недоступны")
     nodes = [wavelink.Node(**n) for n in NODES]
     await wavelink.Pool.connect(nodes=nodes, client=bot)
     await tree.sync()

@@ -5,6 +5,11 @@ import wavelink
 import asyncio
 import random
 import os
+import asyncpg
+import aiohttp
+import re
+import time
+import base64
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -13,9 +18,13 @@ load_dotenv()
 # ─────────────────────────────────────────────
 #  Конфигурация
 # ─────────────────────────────────────────────
-DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
-IDLE_TIMEOUT     = 300   # секунд тишины перед автовыходом
-EMPTY_CH_TIMEOUT = 60    # секунд в пустом канале
+DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
+DATABASE_URL          = os.getenv("DATABASE_URL")
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+IDLE_TIMEOUT          = 300
+EMPTY_CH_TIMEOUT      = 60
+SPOTIFY_TRACK_LIMIT   = 50   # максимум треков из Spotify плейлиста/альбома
 
 NODES = [
     {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
@@ -33,6 +42,191 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 idle_tasks: dict[int, asyncio.Task] = {}
+db_pool: Optional[asyncpg.Pool] = None
+# recording_sessions: guild_id -> {user_id, playlist_id, playlist_name}
+recording_sessions: dict[int, dict] = {}
+# Кэш Spotify токена
+_spotify_token: Optional[str] = None
+_spotify_token_expires: float = 0.0
+
+
+# ─────────────────────────────────────────────
+#  База данных
+# ─────────────────────────────────────────────
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS playlists (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT NOT NULL,
+                name       TEXT   NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, name)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS playlist_tracks (
+                id          SERIAL  PRIMARY KEY,
+                playlist_id INTEGER REFERENCES playlists(id) ON DELETE CASCADE,
+                title       TEXT    NOT NULL,
+                uri         TEXT    NOT NULL,
+                duration    INTEGER NOT NULL,
+                position    INTEGER NOT NULL
+            )
+        """)
+
+
+async def db_create_playlist(user_id: int, name: str) -> Optional[int]:
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO playlists (user_id, name) VALUES ($1, $2) RETURNING id",
+                user_id, name
+            )
+            return row["id"]
+    except asyncpg.UniqueViolationError:
+        return None
+
+
+async def db_get_playlist(user_id: int, name: str) -> Optional[dict]:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM playlists WHERE user_id=$1 AND name=$2", user_id, name
+        )
+        return dict(row) if row else None
+
+
+async def db_get_user_playlists(user_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT p.id, p.name, COUNT(t.id) AS track_count "
+            "FROM playlists p LEFT JOIN playlist_tracks t ON p.id=t.playlist_id "
+            "WHERE p.user_id=$1 GROUP BY p.id ORDER BY p.created_at",
+            user_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def db_delete_playlist(user_id: int, name: str) -> bool:
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM playlists WHERE user_id=$1 AND name=$2", user_id, name
+        )
+        return result != "DELETE 0"
+
+
+async def db_add_track(playlist_id: int, title: str, uri: str, duration: int):
+    async with db_pool.acquire() as conn:
+        pos = await conn.fetchval(
+            "SELECT COALESCE(MAX(position),0)+1 FROM playlist_tracks WHERE playlist_id=$1",
+            playlist_id
+        )
+        await conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id,title,uri,duration,position) "
+            "VALUES ($1,$2,$3,$4,$5)",
+            playlist_id, title, uri, duration, pos
+        )
+
+
+async def db_get_tracks(playlist_id: int) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM playlist_tracks WHERE playlist_id=$1 ORDER BY position",
+            playlist_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def db_remove_track(playlist_id: int, position: int) -> bool:
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id=$1 AND position=$2",
+            playlist_id, position
+        )
+        return result != "DELETE 0"
+
+
+# ─────────────────────────────────────────────
+#  Spotify
+# ─────────────────────────────────────────────
+async def get_spotify_token() -> Optional[str]:
+    global _spotify_token, _spotify_token_expires
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    if _spotify_token and time.time() < _spotify_token_expires:
+        return _spotify_token
+    creds = base64.b64encode(
+        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
+    ).decode()
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {creds}"},
+            data={"grant_type": "client_credentials"},
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            _spotify_token = data["access_token"]
+            _spotify_token_expires = time.time() + data["expires_in"] - 60
+            return _spotify_token
+
+
+def parse_spotify_url(url: str) -> Optional[tuple]:
+    m = re.search(r'spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)', url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r'spotify:(track|album|playlist):([A-Za-z0-9]+)', url)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+async def fetch_spotify_tracks(url: str) -> Optional[list]:
+    """Возвращает список {title, artist} или None."""
+    parsed = parse_spotify_url(url)
+    if not parsed:
+        return None
+    sp_type, sp_id = parsed
+    token = await get_spotify_token()
+    if not token:
+        return None
+    headers = {"Authorization": f"Bearer {token}"}
+    tracks = []
+    async with aiohttp.ClientSession() as s:
+        if sp_type == "track":
+            async with s.get(
+                f"https://api.spotify.com/v1/tracks/{sp_id}", headers=headers
+            ) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+                tracks.append({"title": d["name"], "artist": d["artists"][0]["name"]})
+        elif sp_type == "album":
+            async with s.get(
+                f"https://api.spotify.com/v1/albums/{sp_id}/tracks?limit=50",
+                headers=headers,
+            ) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+                for item in d["items"][:SPOTIFY_TRACK_LIMIT]:
+                    tracks.append({"title": item["name"], "artist": item["artists"][0]["name"]})
+        elif sp_type == "playlist":
+            async with s.get(
+                f"https://api.spotify.com/v1/playlists/{sp_id}/tracks?limit=50",
+                headers=headers,
+            ) as r:
+                if r.status != 200:
+                    return None
+                d = await r.json()
+                for item in d["items"][:SPOTIFY_TRACK_LIMIT]:
+                    t = item.get("track")
+                    if t:
+                        tracks.append({"title": t["name"], "artist": t["artists"][0]["name"]})
+    return tracks or None
 
 
 # ─────────────────────────────────────────────
@@ -52,7 +246,6 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
     async def _timer():
         await asyncio.sleep(IDLE_TIMEOUT)
         player: wavelink.Player = guild.voice_client
-        # Исправлен баг: не выходим если трек на паузе
         if player and not player.playing and not player.paused:
             await player.disconnect()
             idle_tasks.pop(guild.id, None)
@@ -68,7 +261,7 @@ def cancel_idle_timer(guild_id: int):
 
 
 # ─────────────────────────────────────────────
-#  Модальное окно очереди
+#  Модальные окна
 # ─────────────────────────────────────────────
 class QueueModal(discord.ui.Modal, title="Очередь треков"):
     count = discord.ui.TextInput(
@@ -87,19 +280,16 @@ class QueueModal(discord.ui.Modal, title="Очередь треков"):
         if not player or (not player.current and player.queue.is_empty):
             await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
             return
-
         try:
             limit = int(self.count.value) if self.count.value.strip() else None
         except ValueError:
             await interaction.response.send_message("❗ Введи число.", ephemeral=True)
             return
-
         lines = []
         if player.current:
             t = player.current
             link = f" — [открыть]({t.uri})" if t.uri else ""
             lines.append(f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n")
-
         if not player.queue.is_empty:
             queue_list = list(player.queue)
             total = len(queue_list)
@@ -110,9 +300,40 @@ class QueueModal(discord.ui.Modal, title="Очередь треков"):
             if limit and total > limit:
                 lines.append(f"_...и ещё {total - limit} треков_")
             elif not limit and total > 20:
-                lines.append(f"_...и ещё {total - 20} треков (уточни число для просмотра)_")
-
+                lines.append(f"_...и ещё {total - 20} треков_")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейлист"):
+    playlist_name = discord.ui.TextInput(
+        label="Название плейлиста",
+        placeholder="Введи название плейлиста",
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__()
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        player: wavelink.Player = self.guild.voice_client
+        if not player or not player.current:
+            await interaction.response.send_message("❗ Ничего не играет.", ephemeral=True)
+            return
+        name = self.playlist_name.value.strip()
+        playlist = await db_get_playlist(interaction.user.id, name)
+        if not playlist:
+            await interaction.response.send_message(
+                f"❗ Плейлист **{name}** не найден. Создай через `/playlist create {name}`",
+                ephemeral=True,
+            )
+            return
+        track = player.current
+        await db_add_track(playlist["id"], track.title, track.uri, track.length)
+        await interaction.response.send_message(
+            f"✅ **{track.title}** добавлен в плейлист **{name}**!", ephemeral=True
+        )
 
 
 # ─────────────────────────────────────────────
@@ -146,9 +367,7 @@ class PlayerControls(discord.ui.View):
         p = self.player
         if p and (p.playing or p.paused):
             await p.skip(force=True)
-            await interaction.response.defer()
-        else:
-            await interaction.response.defer()
+        await interaction.response.defer()
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0)
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -180,12 +399,16 @@ class PlayerControls(discord.ui.View):
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(QueueModal(self.guild))
 
+    @discord.ui.button(emoji="💾", style=discord.ButtonStyle.secondary, row=1)
+    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AddToPlaylistModal(self.guild))
+
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.player
         if p:
             p.queue.clear()
-            cancel_idle_timer(self.guild.id)  # Исправлен баг: чистим таймер
+            cancel_idle_timer(self.guild.id)
             await p.stop()
             await p.disconnect()
         await interaction.response.send_message("⏹ Остановлено.", ephemeral=True)
@@ -195,7 +418,7 @@ class PlayerControls(discord.ui.View):
 #  View: выбор трека из результатов поиска
 # ─────────────────────────────────────────────
 class TrackSelectView(discord.ui.View):
-    def __init__(self, tracks: list[wavelink.Playable], guild: discord.Guild,
+    def __init__(self, tracks: list, guild: discord.Guild,
                  voice_channel: discord.VoiceChannel,
                  text_channel: discord.TextChannel,
                  search_msg: discord.Message):
@@ -205,12 +428,10 @@ class TrackSelectView(discord.ui.View):
         self.voice_channel = voice_channel
         self.text_channel = text_channel
         self.search_msg = search_msg
-
         for i in range(len(tracks)):
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.primary)
             btn.callback = self._make_cb(i)
             self.add_item(btn)
-
         cancel = discord.ui.Button(label="✖ Отмена", style=discord.ButtonStyle.danger)
         cancel.callback = self._cancel
         self.add_item(cancel)
@@ -219,16 +440,13 @@ class TrackSelectView(discord.ui.View):
         async def callback(interaction: discord.Interaction):
             await interaction.response.defer()
             track = self.tracks[index]
-
             player: wavelink.Player = self.guild.voice_client
             if player is None:
                 player = await self.voice_channel.connect(cls=wavelink.Player)
             elif player.channel != self.voice_channel:
                 await player.move_to(self.voice_channel)
-
             player.autoplay = wavelink.AutoPlayMode.disabled
             player._text_channel_id = self.text_channel.id
-
             if not player.playing:
                 await self.search_msg.delete()
                 await player.play(track)
@@ -236,9 +454,8 @@ class TrackSelectView(discord.ui.View):
                 await player.queue.put_wait(track)
                 await self.search_msg.edit(
                     content=f"➕ **Добавлено:** {track.title} `[{format_duration(track.length)}]`",
-                    view=None
+                    view=None,
                 )
-
             cancel_idle_timer(self.guild.id)
             self.stop()
         return callback
@@ -258,6 +475,11 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     track = payload.track
     guild = player.guild
 
+    # Запись в плейлист
+    if guild.id in recording_sessions:
+        session = recording_sessions[guild.id]
+        await db_add_track(session["playlist_id"], track.title, track.uri, track.length)
+
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
     if not channel:
@@ -266,8 +488,8 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     msg_id = getattr(player, "_now_playing_msg_id", None)
     if msg_id:
         try:
-            old_msg = await channel.fetch_message(msg_id)
-            await old_msg.delete()
+            old = await channel.fetch_message(msg_id)
+            await old.delete()
         except Exception:
             pass
 
@@ -276,11 +498,15 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         wavelink.QueueMode.loop:     "трек 🔂",
         wavelink.QueueMode.loop_all: "очередь 🔁",
     }
+    recording_indicator = ""
+    if guild.id in recording_sessions:
+        recording_indicator = f" | 🔴 Запись: **{recording_sessions[guild.id]['playlist_name']}**"
+
     link = f" — [открыть]({track.uri})" if track.uri else ""
     text = (
         f"🎵 **Сейчас играет:** {track.title} "
         f"`[{format_duration(track.length)}]`{link}\n"
-        f"Повтор: **{loop_labels[player.queue.mode]}**"
+        f"Повтор: **{loop_labels[player.queue.mode]}**{recording_indicator}"
     )
     msg = await channel.send(text, view=PlayerControls(guild))
     player._now_playing_msg_id = msg.id
@@ -290,20 +516,16 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     player = payload.player
     guild = player.guild
-
     channel_id = getattr(player, "_text_channel_id", None)
     channel = guild.get_channel(channel_id) if channel_id else None
 
     if player.queue.mode == wavelink.QueueMode.loop:
         await player.play(payload.track)
         return
-
     if player.queue.mode == wavelink.QueueMode.loop_all:
         await player.queue.put_wait(payload.track)
-
     if not player.queue.is_empty:
-        next_track = player.queue.get()
-        await player.play(next_track)
+        await player.play(player.queue.get())
     elif channel:
         await start_idle_timer(guild, channel)
 
@@ -315,51 +537,58 @@ async def on_wavelink_inactive_player(player: wavelink.Player):
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды
+#  Slash-команды: воспроизведение
 # ─────────────────────────────────────────────
-@tree.command(name="play", description="Поиск трека или добавление плейлиста с YouTube")
-@app_commands.describe(query="Название трека, ссылка на видео или плейлист")
-async def play_cmd(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+PLATFORM_CHOICES = [
+    app_commands.Choice(name="YouTube",    value="yt"),
+    app_commands.Choice(name="SoundCloud", value="sc"),
+]
 
+
+@tree.command(name="play", description="Поиск трека или добавление плейлиста")
+@app_commands.describe(query="Название трека, ссылка на видео или плейлист", platform="Платформа поиска")
+@app_commands.choices(platform=PLATFORM_CHOICES)
+async def play_cmd(interaction: discord.Interaction, query: str,
+                   platform: app_commands.Choice[str] = None):
+    await interaction.response.defer()
     if not interaction.user.voice:
         await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
         return
 
     msg = await interaction.followup.send(f"🔍 Ищу **{query}**...", wait=True)
-    results = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
+
+    source = wavelink.TrackSource.SoundCloud if (platform and platform.value == "sc") \
+        else wavelink.TrackSource.YouTube
+    results = await wavelink.Playable.search(query, source=source)
 
     if not results:
         await msg.edit(content="😕 Ничего не найдено.")
         return
 
-    # Подключаемся к каналу заранее
     player: wavelink.Player = interaction.guild.voice_client
     if player is None:
         player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
     elif player.channel != interaction.user.voice.channel:
         await player.move_to(interaction.user.voice.channel)
-
     player.autoplay = wavelink.AutoPlayMode.disabled
     player._text_channel_id = interaction.channel.id
     cancel_idle_timer(interaction.guild_id)
 
-    # Если результат — плейлист
+    # Плейлист
     if isinstance(results, wavelink.Playlist):
         for track in results.tracks:
             await player.queue.put_wait(track)
         if not player.playing:
-            first = player.queue.get()
             await msg.delete()
-            await player.play(first)
+            await player.play(player.queue.get())
         else:
             await msg.edit(
                 content=f"📋 **Плейлист добавлен:** {results.name} — `{len(results.tracks)} треков`",
-                view=None
+                view=None,
             )
         return
 
-    # Если одиночный трек по ссылке (не поиск)
+    # Одиночная ссылка
     if query.startswith("http") and len(results) == 1:
         track = results[0]
         await player.queue.put_wait(track)
@@ -369,23 +598,96 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         else:
             await msg.edit(
                 content=f"➕ **Добавлено:** {track.title} `[{format_duration(track.length)}]`",
-                view=None
+                view=None,
             )
         return
 
-    # Обычный поиск — показываем список
+    # Обычный поиск
     tracks = results[:5]
     lines = ["**Результаты поиска:**\n"]
     for i, t in enumerate(tracks, 1):
         lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`")
     lines.append("\nВыбери трек кнопкой:")
-
     view = TrackSelectView(tracks, interaction.guild,
-                           interaction.user.voice.channel,
-                           interaction.channel, msg)
+                           interaction.user.voice.channel, interaction.channel, msg)
     await msg.edit(content="\n".join(lines), view=view)
 
 
+@tree.command(name="spotify", description="Добавить трек/альбом/плейлист из Spotify")
+@app_commands.describe(url="Ссылка на Spotify")
+async def spotify_cmd(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+    if not interaction.user.voice:
+        await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
+        return
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        await interaction.followup.send(
+            "❗ Spotify не настроен. Добавь `SPOTIFY_CLIENT_ID` и `SPOTIFY_CLIENT_SECRET` в Variables на Railway."
+        )
+        return
+
+    msg = await interaction.followup.send("🎵 Получаю треки из Spotify...", wait=True)
+    spotify_tracks = await fetch_spotify_tracks(url)
+    if not spotify_tracks:
+        await msg.edit(content="❗ Не удалось получить треки. Проверь ссылку.")
+        return
+
+    player: wavelink.Player = interaction.guild.voice_client
+    if player is None:
+        player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    elif player.channel != interaction.user.voice.channel:
+        await player.move_to(interaction.user.voice.channel)
+    player.autoplay = wavelink.AutoPlayMode.disabled
+    player._text_channel_id = interaction.channel.id
+    cancel_idle_timer(interaction.guild_id)
+
+    await msg.edit(content=f"🔍 Ищу {len(spotify_tracks)} треков на YouTube...")
+    added = 0
+    for sp in spotify_tracks:
+        results = await wavelink.Playable.search(
+            f"{sp['artist']} - {sp['title']}", source=wavelink.TrackSource.YouTube
+        )
+        if results:
+            track = results[0] if isinstance(results, list) else results.tracks[0]
+            await player.queue.put_wait(track)
+            added += 1
+
+    if added == 0:
+        await msg.edit(content="😕 Не удалось найти треки на YouTube.")
+        return
+    if not player.playing:
+        await msg.delete()
+        await player.play(player.queue.get())
+    else:
+        await msg.edit(content=f"📋 Добавлено из Spotify: `{added} треков`")
+
+
+@tree.command(name="savequeue", description="Сохранить текущую очередь как плейлист")
+@app_commands.describe(name="Название нового плейлиста")
+async def savequeue_cmd(interaction: discord.Interaction, name: str):
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player or (not player.current and player.queue.is_empty):
+        await interaction.response.send_message("❗ Очередь пуста.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    playlist_id = await db_create_playlist(interaction.user.id, name.strip())
+    if playlist_id is None:
+        await interaction.followup.send(f"❗ Плейлист **{name}** уже существует.")
+        return
+    tracks = []
+    if player.current:
+        tracks.append(player.current)
+    tracks.extend(list(player.queue))
+    for t in tracks:
+        await db_add_track(playlist_id, t.title, t.uri, t.length)
+    await interaction.followup.send(
+        f"✅ Очередь сохранена как плейлист **{name}** — `{len(tracks)} треков`!"
+    )
+
+
+# ─────────────────────────────────────────────
+#  Slash-команды: управление плеером
+# ─────────────────────────────────────────────
 @tree.command(name="skip", description="Пропустить текущий трек")
 async def skip_cmd(interaction: discord.Interaction):
     player: wavelink.Player = interaction.guild.voice_client
@@ -431,7 +733,7 @@ async def stop_cmd(interaction: discord.Interaction):
     player: wavelink.Player = interaction.guild.voice_client
     if player:
         player.queue.clear()
-        cancel_idle_timer(interaction.guild_id)  # Исправлен баг: чистим таймер
+        cancel_idle_timer(interaction.guild_id)
         await player.stop()
         await player.disconnect()
         await interaction.response.send_message("⏹ Остановлено.")
@@ -503,20 +805,17 @@ async def queue_cmd(interaction: discord.Interaction):
     if not player or (not player.current and player.queue.is_empty):
         await interaction.response.send_message("📭 Очередь пуста.")
         return
-
     lines = []
     if player.current:
         t = player.current
         link = f" — [открыть]({t.uri})" if t.uri else ""
         lines.append(f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n")
-
     if not player.queue.is_empty:
         lines.append("**В очереди:**")
         for i, t in enumerate(list(player.queue)[:10], 1):
             lines.append(f"`{i}.` 🎵 {t.title} `[{format_duration(t.length)}]`")
         if len(player.queue) > 10:
             lines.append(f"_...и ещё {len(player.queue) - 10} треков_")
-
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -534,6 +833,170 @@ async def np_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
+#  Slash-команды: плейлисты
+# ─────────────────────────────────────────────
+playlist_group = app_commands.Group(name="playlist", description="Управление личными плейлистами")
+
+
+@playlist_group.command(name="create", description="Создать новый плейлист")
+@app_commands.describe(name="Название плейлиста")
+async def pl_create(interaction: discord.Interaction, name: str):
+    playlist_id = await db_create_playlist(interaction.user.id, name.strip())
+    if playlist_id is None:
+        await interaction.response.send_message(f"❗ Плейлист **{name}** уже существует.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ Плейлист **{name}** создан!", ephemeral=True)
+
+
+@playlist_group.command(name="list", description="Показать твои плейлисты")
+async def pl_list(interaction: discord.Interaction):
+    playlists = await db_get_user_playlists(interaction.user.id)
+    if not playlists:
+        await interaction.response.send_message(
+            "📭 У тебя нет плейлистов. Создай через `/playlist create`", ephemeral=True
+        )
+        return
+    lines = ["**Твои плейлисты:**\n"]
+    for i, p in enumerate(playlists, 1):
+        rec = recording_sessions.get(interaction.guild_id, {})
+        indicator = "🔴 " if rec.get("playlist_id") == p["id"] else ""
+        lines.append(f"`{i}.` {indicator}**{p['name']}** — {p['track_count']} треков")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@playlist_group.command(name="play", description="Воспроизвести плейлист")
+@app_commands.describe(name="Название плейлиста")
+async def pl_play(interaction: discord.Interaction, name: str):
+    await interaction.response.defer()
+    if not interaction.user.voice:
+        await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
+        return
+    playlist = await db_get_playlist(interaction.user.id, name.strip())
+    if not playlist:
+        await interaction.followup.send(f"❗ Плейлист **{name}** не найден.")
+        return
+    tracks = await db_get_tracks(playlist["id"])
+    if not tracks:
+        await interaction.followup.send(f"❗ Плейлист **{name}** пуст.")
+        return
+
+    player: wavelink.Player = interaction.guild.voice_client
+    if player is None:
+        player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    elif player.channel != interaction.user.voice.channel:
+        await player.move_to(interaction.user.voice.channel)
+    player.autoplay = wavelink.AutoPlayMode.disabled
+    player._text_channel_id = interaction.channel.id
+    cancel_idle_timer(interaction.guild_id)
+
+    msg = await interaction.followup.send(f"⏳ Загружаю плейлист **{name}**...", wait=True)
+    added = 0
+    for t in tracks:
+        results = await wavelink.Playable.search(t["uri"])
+        if results:
+            track = results[0] if isinstance(results, list) else results.tracks[0]
+            await player.queue.put_wait(track)
+            added += 1
+
+    if added == 0:
+        await msg.edit(content=f"😕 Не удалось загрузить треки из **{name}**.")
+        return
+    if not player.playing:
+        await msg.delete()
+        await player.play(player.queue.get())
+    else:
+        await msg.edit(content=f"📋 Плейлист **{name}** добавлен в очередь — `{added} треков`")
+
+
+@playlist_group.command(name="delete", description="Удалить плейлист")
+@app_commands.describe(name="Название плейлиста")
+async def pl_delete(interaction: discord.Interaction, name: str):
+    # Останавливаем запись если нужно
+    rec = recording_sessions.get(interaction.guild_id, {})
+    if rec.get("playlist_name") == name.strip():
+        recording_sessions.pop(interaction.guild_id, None)
+    deleted = await db_delete_playlist(interaction.user.id, name.strip())
+    if not deleted:
+        await interaction.response.send_message(f"❗ Плейлист **{name}** не найден.", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🗑 Плейлист **{name}** удалён.", ephemeral=True)
+
+
+@playlist_group.command(name="record", description="Начать/остановить запись треков в плейлист")
+@app_commands.describe(name="Название плейлиста (не нужно при остановке)")
+async def pl_record(interaction: discord.Interaction, name: Optional[str] = None):
+    guild_id = interaction.guild_id
+    if guild_id in recording_sessions:
+        session = recording_sessions.pop(guild_id)
+        await interaction.response.send_message(
+            f"⏹ Запись в плейлист **{session['playlist_name']}** остановлена.", ephemeral=True
+        )
+        return
+    if not name:
+        await interaction.response.send_message(
+            "❗ Укажи название плейлиста для начала записи.", ephemeral=True
+        )
+        return
+    playlist = await db_get_playlist(interaction.user.id, name.strip())
+    if not playlist:
+        await interaction.response.send_message(
+            f"❗ Плейлист **{name}** не найден. Создай через `/playlist create {name}`",
+            ephemeral=True,
+        )
+        return
+    recording_sessions[guild_id] = {
+        "user_id": interaction.user.id,
+        "playlist_id": playlist["id"],
+        "playlist_name": name.strip(),
+    }
+    await interaction.response.send_message(
+        f"🔴 Запись в **{name}** начата — все треки которые будут играть добавятся автоматически.\n"
+        f"Чтобы остановить — `/playlist record` без аргументов.",
+        ephemeral=True,
+    )
+
+
+@playlist_group.command(name="addtrack", description="Добавить текущий трек в плейлист")
+@app_commands.describe(name="Название плейлиста")
+async def pl_addtrack(interaction: discord.Interaction, name: str):
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player or not player.current:
+        await interaction.response.send_message("❗ Ничего не играет.", ephemeral=True)
+        return
+    playlist = await db_get_playlist(interaction.user.id, name.strip())
+    if not playlist:
+        await interaction.response.send_message(f"❗ Плейлист **{name}** не найден.", ephemeral=True)
+        return
+    track = player.current
+    await db_add_track(playlist["id"], track.title, track.uri, track.length)
+    await interaction.response.send_message(
+        f"✅ **{track.title}** добавлен в **{name}**!", ephemeral=True
+    )
+
+
+@playlist_group.command(name="tracks", description="Показать треки плейлиста")
+@app_commands.describe(name="Название плейлиста")
+async def pl_tracks(interaction: discord.Interaction, name: str):
+    playlist = await db_get_playlist(interaction.user.id, name.strip())
+    if not playlist:
+        await interaction.response.send_message(f"❗ Плейлист **{name}** не найден.", ephemeral=True)
+        return
+    tracks = await db_get_tracks(playlist["id"])
+    if not tracks:
+        await interaction.response.send_message(f"📭 Плейлист **{name}** пуст.", ephemeral=True)
+        return
+    lines = [f"**Плейлист: {name}** — {len(tracks)} треков\n"]
+    for t in tracks[:20]:
+        lines.append(f"`{t['position']}.` {t['title']} `[{format_duration(t['duration'])}]`")
+    if len(tracks) > 20:
+        lines.append(f"_...и ещё {len(tracks) - 20} треков_")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+tree.add_command(playlist_group)
+
+
+# ─────────────────────────────────────────────
 #  Автовыход из пустого канала
 # ─────────────────────────────────────────────
 @bot.event
@@ -542,16 +1005,12 @@ async def on_voice_state_update(member: discord.Member,
                                 after: discord.VoiceState):
     if member.bot:
         return
-
     player: wavelink.Player = member.guild.voice_client
     if not player:
         return
-
-    # Исправлен баг: кто-то зашёл обратно — отменяем таймер выхода
     if after.channel and after.channel == player.channel:
         cancel_idle_timer(member.guild.id)
         return
-
     non_bots = [m for m in player.channel.members if not m.bot]
     if len(non_bots) == 0:
         await asyncio.sleep(EMPTY_CH_TIMEOUT)
@@ -573,6 +1032,11 @@ async def on_voice_state_update(member: discord.Member,
 @bot.event
 async def on_ready():
     print(f"✅ Бот запущен как {bot.user}")
+    if DATABASE_URL:
+        await init_db()
+        print("✅ База данных подключена")
+    else:
+        print("⚠️ DATABASE_URL не задан — плейлисты недоступны")
     nodes = [wavelink.Node(**n) for n in NODES]
     await wavelink.Pool.connect(nodes=nodes, client=bot)
     await tree.sync()

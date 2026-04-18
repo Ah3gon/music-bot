@@ -317,8 +317,8 @@ async def on_wavelink_inactive_player(player: wavelink.Player):
 # ─────────────────────────────────────────────
 #  Slash-команды
 # ─────────────────────────────────────────────
-@tree.command(name="play", description="Поиск и воспроизведение трека с YouTube")
-@app_commands.describe(query="Название трека или исполнитель")
+@tree.command(name="play", description="Поиск трека или добавление плейлиста с YouTube")
+@app_commands.describe(query="Название трека, ссылка на видео или плейлист")
 async def play_cmd(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
 
@@ -333,6 +333,47 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await msg.edit(content="😕 Ничего не найдено.")
         return
 
+    # Подключаемся к каналу заранее
+    player: wavelink.Player = interaction.guild.voice_client
+    if player is None:
+        player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    elif player.channel != interaction.user.voice.channel:
+        await player.move_to(interaction.user.voice.channel)
+
+    player.autoplay = wavelink.AutoPlayMode.disabled
+    player._text_channel_id = interaction.channel.id
+    cancel_idle_timer(interaction.guild_id)
+
+    # Если результат — плейлист
+    if isinstance(results, wavelink.Playlist):
+        for track in results.tracks:
+            await player.queue.put_wait(track)
+        if not player.playing:
+            first = player.queue.get()
+            await msg.delete()
+            await player.play(first)
+        else:
+            await msg.edit(
+                content=f"📋 **Плейлист добавлен:** {results.name} — `{len(results.tracks)} треков`",
+                view=None
+            )
+        return
+
+    # Если одиночный трек по ссылке (не поиск)
+    if query.startswith("http") and len(results) == 1:
+        track = results[0]
+        await player.queue.put_wait(track)
+        if not player.playing:
+            await msg.delete()
+            await player.play(player.queue.get())
+        else:
+            await msg.edit(
+                content=f"➕ **Добавлено:** {track.title} `[{format_duration(track.length)}]`",
+                view=None
+            )
+        return
+
+    # Обычный поиск — показываем список
     tracks = results[:5]
     lines = ["**Результаты поиска:**\n"]
     for i, t in enumerate(tracks, 1):
@@ -342,11 +383,6 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     view = TrackSelectView(tracks, interaction.guild,
                            interaction.user.voice.channel,
                            interaction.channel, msg)
-
-    player: wavelink.Player = interaction.guild.voice_client
-    if player:
-        player._text_channel_id = interaction.channel.id
-
     await msg.edit(content="\n".join(lines), view=view)
 
 

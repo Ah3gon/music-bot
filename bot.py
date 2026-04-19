@@ -43,8 +43,8 @@ QUEUE_DEFAULT_SHOW    = 15
 PLAYLIST_TRACKS_SHOW  = 20
 LYRICS_MAX_CHARS      = 3900
 PLAYLIST_NAME_MAX     = 50
-# Максимум секунд, на которые можно перемотать за раз
 SEEK_MAX_SECONDS      = 3600
+TRACKS_PER_PAGE       = 15
 
 EFFECTS = {
     "bassboost": "басс-буст 🔈",
@@ -77,16 +77,13 @@ empty_channel_tasks: dict[int, asyncio.Task] = {}
 db_pool: Optional[asyncpg.Pool] = None
 track_history: dict[int, list] = {}
 current_effect: dict[int, str] = {}
-# Состояние плеера: text_channel_id, now_playing_msg_id,
-# birthday_resume (для возврата к треку после ДР-поздравления)
 player_state: dict[int, dict] = {}
-# Счётчик треков пользователей: {guild_id: {user_id: count}}
 user_track_counts: dict[int, dict[int, int]] = {}
-# Текущие голосования за скип: {guild_id: VoteSkipView}
 active_votes: dict[int, "VoteSkipView"] = {}
+# Метки треков для fair_queue: {guild_id: {track.identifier: user_id}}
+track_user_map: dict[int, dict[str, int]] = {}
 _spotify_token: Optional[str] = None
 _spotify_token_expires: float = 0.0
-
 _ready_once = False
 
 
@@ -150,16 +147,21 @@ async def init_db():
                 dj_role_id         BIGINT  DEFAULT NULL,
                 vote_skip_enabled  BOOLEAN DEFAULT FALSE,
                 vote_skip_percent  INTEGER DEFAULT 50,
-                track_limit        INTEGER DEFAULT 0
+                track_limit        INTEGER DEFAULT 0,
+                fair_queue         BOOLEAN DEFAULT FALSE
             )
         """)
-        try:
-            await conn.execute(
-                "ALTER TABLE birthdays ADD COLUMN IF NOT EXISTS "
-                "birthday_song TEXT DEFAULT 'Happy Birthday instrumental'"
-            )
-        except Exception:
-            pass
+        # Миграции (безопасно добавляют колонки если их не было)
+        for migration in [
+            "ALTER TABLE birthdays ADD COLUMN IF NOT EXISTS "
+            "birthday_song TEXT DEFAULT 'Happy Birthday instrumental'",
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS "
+            "fair_queue BOOLEAN DEFAULT FALSE",
+        ]:
+            try:
+                await conn.execute(migration)
+            except Exception as e:
+                log.debug("Migration skipped: %s", e)
 
 
 async def db_get_settings(guild_id: int) -> dict:
@@ -175,6 +177,7 @@ async def db_get_settings(guild_id: int) -> dict:
             "vote_skip_enabled": False,
             "vote_skip_percent": 50,
             "track_limit": 0,
+            "fair_queue": False,
         }
 
 
@@ -356,7 +359,83 @@ async def check_track_limit(interaction: discord.Interaction, count: int = 1) ->
 
 
 # ─────────────────────────────────────────────
-#  Spotify (fallback, если нода не поддерживает Spotify напрямую)
+#  Fair queue: метки треков
+# ─────────────────────────────────────────────
+def tag_track(guild_id: int, track, user_id: int):
+    gmap = track_user_map.setdefault(guild_id, {})
+    gmap[track.identifier] = user_id
+
+
+def get_track_owner(guild_id: int, track) -> Optional[int]:
+    return track_user_map.get(guild_id, {}).get(track.identifier)
+
+
+def cleanup_track_map(guild_id: int, keep_tracks: list):
+    gmap = track_user_map.get(guild_id)
+    if not gmap:
+        return
+    keep_ids = {t.identifier for t in keep_tracks}
+    for tid in list(gmap.keys()):
+        if tid not in keep_ids:
+            del gmap[tid]
+
+
+async def add_tracks_fairly(
+    player: wavelink.Player,
+    tracks: list,
+    user_id: int,
+    enabled: bool = True,
+):
+    """Добавляет треки, чередуя их с чужими если fair_queue включено."""
+    guild_id = player.guild.id
+    for t in tracks:
+        tag_track(guild_id, t, user_id)
+
+    if not enabled or len(tracks) <= 1:
+        for t in tracks:
+            await player.queue.put_wait(t)
+        return
+
+    existing = list(player.queue)
+    foreign_tracks = [
+        t for t in existing if get_track_owner(guild_id, t) != user_id
+    ]
+
+    # Если чужих треков < 2 — не чередуем, просто добавляем в конец
+    if len(foreign_tracks) < 2:
+        for t in tracks:
+            await player.queue.put_wait(t)
+        return
+
+    my_existing = [t for t in existing if get_track_owner(guild_id, t) == user_id]
+
+    new_queue = []
+    max_len = max(len(foreign_tracks), len(tracks))
+    fi, ni = 0, 0
+    for _ in range(max_len):
+        if fi < len(foreign_tracks):
+            new_queue.append(foreign_tracks[fi])
+            fi += 1
+        if ni < len(tracks):
+            new_queue.append(tracks[ni])
+            ni += 1
+    new_queue.extend(my_existing)
+
+    player.queue.clear()
+    for t in new_queue:
+        await player.queue.put_wait(t)
+    cleanup_track_map(guild_id, new_queue)
+
+
+async def get_fair_queue_enabled(guild_id: int) -> bool:
+    if not db_pool:
+        return False
+    settings = await db_get_settings(guild_id)
+    return settings.get("fair_queue", False)
+
+
+# ─────────────────────────────────────────────
+#  Spotify (fallback)
 # ─────────────────────────────────────────────
 async def get_spotify_token() -> Optional[str]:
     global _spotify_token, _spotify_token_expires
@@ -399,9 +478,6 @@ def parse_spotify_url(url: str) -> Optional[tuple]:
 
 
 async def fetch_spotify_tracks(url: str) -> Optional[list]:
-    """Используется как fallback, если /play не смог обработать Spotify-ссылку.
-    Требуется только для альбомов/плейлистов — одиночные треки Lavalink
-    обычно обрабатывает сам через LavaSrc."""
     parsed = parse_spotify_url(url)
     if not parsed:
         return None
@@ -551,40 +627,112 @@ def is_birthday_today(day: int, month: int) -> bool:
     return today.day == day and today.month == month
 
 
-def build_queue_text(player: wavelink.Player, limit: Optional[int] = None) -> str:
-    lines = []
-    if player.current:
-        t = player.current
-        link = f" — [открыть]({t.uri})" if t.uri else ""
-        lines.append(f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n")
-    if not player.queue.is_empty:
-        queue_list = list(player.queue)
-        total = len(queue_list)
-        show_n = limit if limit else QUEUE_DEFAULT_SHOW
-        shown = queue_list[:show_n]
-        lines.append("**В очереди:**")
-        for i, t in enumerate(shown, 1):
-            lines.append(f"`{i}.` 🎵 {t.title} `[{format_duration(t.length)}]`")
-        if total > show_n:
-            lines.append(f"_...и ещё {total - show_n} треков_")
-    return "\n".join(lines) if lines else "📭 Очередь пуста."
+async def full_disconnect(guild: discord.Guild):
+    player: wavelink.Player = guild.voice_client
+    cancel_idle_timer(guild.id)
+    cancel_empty_channel_timer(guild.id)
+    current_effect.pop(guild.id, None)
+    reset_track_counts(guild.id)
+    active_votes.pop(guild.id, None)
+    track_user_map.pop(guild.id, None)
+    clear_player_state(guild.id)
+    if player:
+        try:
+            player.queue.clear()
+        except Exception:
+            pass
+        try:
+            await player.disconnect()
+        except Exception as e:
+            log.debug("Disconnect error: %s", e)
 
 
 # ─────────────────────────────────────────────
-#  Lyrics (Genius + fallback на lyrics.ovh)
+#  LYRICS: LRClib → Genius → lyrics.ovh
 # ─────────────────────────────────────────────
 def _clean_title(title: str) -> tuple[str, str]:
-    """Возвращает (artist, song). Если артист не определён — пустая строка."""
-    # Пытаемся разделить "Артист - Название"
-    parts = re.split(r'\s*[-–—]\s*', title, maxsplit=1)
+    parts = re.split(r'\s*[-–—|]\s*', title, maxsplit=1)
     if len(parts) == 2:
         artist, song = parts[0].strip(), parts[1].strip()
     else:
         artist, song = "", title.strip()
-    # Убираем шум: (Official Video), [Lyrics], ft. etc.
-    song = re.sub(r'\(.*?\)|\[.*?\]', '', song).strip()
-    song = re.sub(r'\s*(feat\.?|ft\.?|featuring)\s+.*$', '', song, flags=re.IGNORECASE).strip()
+    song = re.sub(r'\(.*?\)|\[.*?\]|\{.*?\}', '', song).strip()
+    song = re.sub(r'\s*(feat\.?|ft\.?|featuring|prod\.?(\sby)?|w[/\\])\s+.*$',
+                  '', song, flags=re.IGNORECASE).strip()
+    song = re.sub(r'\b(official|lyric|audio|video|music|mv|hd|4k|hq)\s*(video|audio)?\b.*$',
+                  '', song, flags=re.IGNORECASE).strip()
+    artist = re.sub(r'\s*(feat\.?|ft\.?|featuring|x|&)\s+.*$', '', artist,
+                    flags=re.IGNORECASE).strip()
     return artist, song
+
+
+async def _fetch_lrclib(title: str, duration_ms: Optional[int] = None) -> Optional[dict]:
+    artist, song = _clean_title(title)
+    if not song:
+        return None
+
+    log.info("LRClib search: artist=%r song=%r", artist, song)
+    timeout = aiohttp.ClientTimeout(total=8)
+    headers = {"User-Agent": f"{BOT_NAME}Bot/1.0 (Discord music bot)"}
+
+    async def _try_request(url: str, params: dict) -> Optional[object]:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+                async with s.get(url, params=params) as r:
+                    if r.status != 200:
+                        return None
+                    return await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.debug("LRClib request error: %s", e)
+            return None
+
+    # 1. Точное совпадение по duration
+    if artist and duration_ms and duration_ms > 0:
+        params = {
+            "track_name": song,
+            "artist_name": artist,
+            "duration": duration_ms // 1000,
+        }
+        result = await _try_request("https://lrclib.net/api/get", params)
+        if isinstance(result, dict) and (result.get("plainLyrics") or result.get("syncedLyrics")):
+            log.info("LRClib: нашли через get (exact match)")
+            return {
+                "plain": result.get("plainLyrics"),
+                "synced": result.get("syncedLyrics"),
+            }
+
+    # 2. Поиск
+    query = f"{artist} {song}".strip() if artist else song
+    results = await _try_request("https://lrclib.net/api/search", {"q": query})
+    if not isinstance(results, list) or len(results) == 0:
+        log.info("LRClib: ничего не найдено")
+        return None
+
+    for item in results[:5]:
+        plain = item.get("plainLyrics")
+        synced = item.get("syncedLyrics")
+        if plain or synced:
+            log.info("LRClib: нашли через search (%s)", item.get("trackName"))
+            return {"plain": plain, "synced": synced}
+    log.info("LRClib: все результаты без текста")
+    return None
+
+
+def _is_bad_genius_hit(hit: dict) -> bool:
+    result = hit.get("result", {})
+    url = result.get("url", "").lower()
+    title = result.get("title", "").lower()
+    bad_keywords = [
+        "перевод", "translation", "traducción", "tradução",
+        "genius-users", "genius-romanizations",
+        "annotated", "q-and-a", "interview",
+    ]
+    for kw in bad_keywords:
+        if kw in url or kw in title:
+            return True
+    if result.get("_type") and result["_type"] != "song":
+        return True
+    return False
 
 
 async def _fetch_genius(title: str) -> Optional[str]:
@@ -594,27 +742,46 @@ async def _fetch_genius(title: str) -> Optional[str]:
     query = f"{artist} {song}".strip() if artist else song
     if not query:
         return None
+
+    log.info("Genius search: %r", query)
     headers = {"Authorization": f"Bearer {GENIUS_TOKEN}"}
-    timeout = aiohttp.ClientTimeout(total=8)
+    timeout = aiohttp.ClientTimeout(total=15)
+
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
-            # 1. Поиск
             async with s.get(
                 "https://api.genius.com/search",
                 params={"q": query},
             ) as r:
+                if r.status == 401:
+                    log.warning("Genius: невалидный токен (401)")
+                    return None
                 if r.status != 200:
                     return None
                 data = await r.json()
                 hits = data.get("response", {}).get("hits", [])
-                if not hits:
-                    return None
-                song_url = hits[0]["result"]["url"]
-            # 2. Страница — парсим HTML (без aiohttp headers, User-Agent нужен)
+
+            if not hits:
+                return None
+
+            song_url = None
+            for hit in hits:
+                if _is_bad_genius_hit(hit):
+                    continue
+                song_url = hit["result"]["url"]
+                break
+            if not song_url:
+                return None
+
             async with s.get(
                 song_url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; SurgeBot/1.0)"
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
                 },
             ) as r:
                 if r.status != 200:
@@ -622,34 +789,35 @@ async def _fetch_genius(title: str) -> Optional[str]:
                 html = await r.text()
         return _parse_genius_html(html)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.debug("Genius error: %s", e)
+        log.debug("Genius network error: %s", e)
         return None
     except Exception as e:
-        log.warning("Genius unexpected error: %s", e)
+        log.error("Genius unexpected error: %s", e, exc_info=True)
         return None
 
 
 def _parse_genius_html(html: str) -> Optional[str]:
-    """Извлекает текст из страницы Genius без BeautifulSoup —
-    через регулярки, достаточно надёжно."""
-    # Текст лежит в <div data-lyrics-container="true">...</div>
+    import html as html_module
     containers = re.findall(
-        r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)</div>',
-        html,
-        re.DOTALL,
+        r'<div[^>]*data-lyrics-container="true"[^>]*>(.*?)(?=<div[^>]*data-lyrics-container|</section)',
+        html, re.DOTALL,
     )
+    if not containers:
+        containers = re.findall(
+            r'<div[^>]*class="[^"]*Lyrics__Container[^"]*"[^>]*>(.*?)</div>',
+            html, re.DOTALL,
+        )
     if not containers:
         return None
     combined = "\n".join(containers)
-    # <br/> → \n
+    combined = re.sub(r'<a[^>]*class="[^"]*ReferentFragment[^"]*"[^>]*>(.*?)</a>',
+                      r'\1', combined, flags=re.DOTALL)
     combined = re.sub(r'<br\s*/?>', '\n', combined)
-    # Удалить все остальные теги
     combined = re.sub(r'<[^>]+>', '', combined)
-    # Расшифровка HTML-сущностей
-    import html as html_module
     combined = html_module.unescape(combined)
-    # Нормализация переводов строк
     combined = re.sub(r'\n{3,}', '\n\n', combined).strip()
+    if len(combined) < 50:
+        return None
     return combined or None
 
 
@@ -671,47 +839,37 @@ async def _fetch_lyricsovh(title: str) -> Optional[str]:
                                 return lyrics
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     pass
-            try:
-                url = f"https://api.lyrics.ovh/v1/{song}/{song}"
-                async with s.get(url) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        lyrics = data.get("lyrics")
-                        if lyrics and lyrics.strip():
-                            return lyrics
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                pass
-    except Exception as e:
-        log.debug("Lyrics.ovh error: %s", e)
+    except Exception:
+        pass
     return None
 
 
-async def fetch_lyrics(title: str) -> Optional[str]:
-    """Ищет текст: сначала Genius (если токен есть), потом lyrics.ovh."""
-    if GENIUS_TOKEN:
-        text = await _fetch_genius(title)
+async def fetch_lyrics(title: str, duration_ms: Optional[int] = None) -> Optional[dict]:
+    """Возвращает dict: {'text': ..., 'source': ..., 'synced': bool} либо None."""
+    # 1. LRClib
+    result = await _fetch_lrclib(title, duration_ms)
+    if result:
+        text = result.get("plain")
+        if not text and result.get("synced"):
+            text = re.sub(r'\[\d+:\d+\.\d+\]\s*', '', result["synced"]).strip()
         if text:
-            return text
-    return await _fetch_lyricsovh(title)
+            return {
+                "text": text,
+                "source": "LRClib",
+                "synced": bool(result.get("synced")),
+            }
 
+    # 2. Genius
+    text = await _fetch_genius(title)
+    if text:
+        return {"text": text, "source": "Genius", "synced": False}
 
-async def full_disconnect(guild: discord.Guild):
-    player: wavelink.Player = guild.voice_client
-    cancel_idle_timer(guild.id)
-    cancel_empty_channel_timer(guild.id)
-    current_effect.pop(guild.id, None)
-    reset_track_counts(guild.id)
-    active_votes.pop(guild.id, None)
-    clear_player_state(guild.id)
-    if player:
-        try:
-            player.queue.clear()
-        except Exception:
-            pass
-        try:
-            await player.disconnect()
-        except Exception as e:
-            log.debug("Disconnect error: %s", e)
+    # 3. lyrics.ovh
+    text = await _fetch_lyricsovh(title)
+    if text:
+        return {"text": text, "source": "lyrics.ovh", "synced": False}
+
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -813,37 +971,139 @@ class VoteSkipView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────
-#  Модальные окна
+#  Пагинация очереди
 # ─────────────────────────────────────────────
-class QueueModal(discord.ui.Modal, title="Очередь треков"):
-    count_input = discord.ui.TextInput(
-        label="Сколько треков показать?",
-        placeholder=f"Оставь пустым — покажет {QUEUE_DEFAULT_SHOW}",
-        required=False,
-        max_length=3,
+class JumpToPageModal(discord.ui.Modal, title="Перейти к странице"):
+    page_input = discord.ui.TextInput(
+        label="Номер страницы",
+        placeholder="Введи число",
+        required=True,
+        max_length=4,
     )
 
-    def __init__(self, guild: discord.Guild):
+    def __init__(self, view: "QueuePaginationView"):
         super().__init__()
-        self.guild = guild
+        self.view_ref = view
 
     async def on_submit(self, interaction: discord.Interaction):
-        player: wavelink.Player = self.guild.voice_client
-        if not player or (not player.current and player.queue.is_empty):
-            await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
-            return
-        raw = (self.count_input.value or "").strip()
         try:
-            limit = int(raw) if raw else None
-            if limit is not None and limit < 1:
-                raise ValueError
+            target = int((self.page_input.value or "").strip())
         except ValueError:
-            await interaction.response.send_message("❗ Введи положительное число.", ephemeral=True)
+            await interaction.response.send_message("❗ Введи число.", ephemeral=True)
             return
-        text = build_queue_text(player, limit)
-        await interaction.response.send_message(text, ephemeral=True)
+        total_pages = self.view_ref.total_pages()
+        if target < 1 or target > total_pages:
+            await interaction.response.send_message(
+                f"❗ Номер от 1 до {total_pages}.", ephemeral=True
+            )
+            return
+        self.view_ref.current_page = target - 1
+        await interaction.response.edit_message(
+            content=self.view_ref.build_text(),
+            view=self.view_ref,
+        )
 
 
+class QueuePaginationView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.user_id = user_id
+        self.current_page = 0
+        self.message: Optional[discord.Message] = None
+
+    @property
+    def player(self) -> Optional[wavelink.Player]:
+        return self.guild.voice_client
+
+    def get_queue_snapshot(self) -> list:
+        p = self.player
+        if not p:
+            return []
+        return list(p.queue)
+
+    def total_pages(self) -> int:
+        snapshot = self.get_queue_snapshot()
+        if not snapshot:
+            return 1
+        return max(1, (len(snapshot) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE)
+
+    def build_text(self) -> str:
+        p = self.player
+        snapshot = self.get_queue_snapshot()
+        total_pages = self.total_pages()
+        self.current_page = max(0, min(self.current_page, total_pages - 1))
+
+        lines = []
+        if p and p.current:
+            t = p.current
+            link = f" — [открыть]({t.uri})" if t.uri else ""
+            lines.append(
+                f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n"
+            )
+
+        if not snapshot:
+            lines.append("📭 Очередь пуста.")
+            self._update_buttons(total_pages)
+            return "\n".join(lines)
+
+        start = self.current_page * TRACKS_PER_PAGE
+        end = start + TRACKS_PER_PAGE
+        shown = snapshot[start:end]
+
+        lines.append(
+            f"**Очередь** — `{len(snapshot)} треков` · "
+            f"Страница **{self.current_page + 1}/{total_pages}**\n"
+        )
+        for i, t in enumerate(shown, start=start + 1):
+            link = f" — [открыть]({t.uri})" if t.uri else ""
+            lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`{link}")
+
+        self._update_buttons(total_pages)
+        return "\n".join(lines)
+
+    def _update_buttons(self, total_pages: int):
+        self.first_btn.disabled = self.current_page == 0
+        self.prev_btn.disabled = self.current_page == 0
+        self.next_btn.disabled = self.current_page >= total_pages - 1
+        self.last_btn.disabled = self.current_page >= total_pages - 1
+        self.jump_btn.disabled = total_pages <= 1
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
+    async def first_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = 0
+        await interaction.response.edit_message(content=self.build_text(), view=self)
+
+    @discord.ui.button(emoji="◀", style=discord.ButtonStyle.primary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = max(0, self.current_page - 1)
+        await interaction.response.edit_message(content=self.build_text(), view=self)
+
+    @discord.ui.button(emoji="▶", style=discord.ButtonStyle.primary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = min(self.total_pages() - 1, self.current_page + 1)
+        await interaction.response.edit_message(content=self.build_text(), view=self)
+
+    @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
+    async def last_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page = self.total_pages() - 1
+        await interaction.response.edit_message(content=self.build_text(), view=self)
+
+    @discord.ui.button(label="🔢 К странице", style=discord.ButtonStyle.success)
+    async def jump_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(JumpToPageModal(self))
+
+
+# ─────────────────────────────────────────────
+#  Модалка добавления в плейлист
+# ─────────────────────────────────────────────
 class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейлист"):
     playlist_name = discord.ui.TextInput(
         label="Название плейлиста",
@@ -969,7 +1229,17 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, row=0, label="Очередь")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(QueueModal(self.guild))
+        p = self.player
+        if not p or (not p.current and p.queue.is_empty):
+            await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
+            return
+        view = QueuePaginationView(self.guild, interaction.user.id)
+        text = view.build_text()
+        await interaction.response.send_message(text, view=view, ephemeral=True)
+        try:
+            view.message = await interaction.original_response()
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1, label="-10%")
     async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1091,15 +1361,17 @@ class TrackSelectView(discord.ui.View):
                 return
             player.autoplay = wavelink.AutoPlayMode.disabled
             get_player_state(self.guild.id)["text_channel_id"] = self.text_channel.id
+            fair = await get_fair_queue_enabled(self.guild.id)
             if not player.playing:
                 try:
                     await self.search_msg.delete()
                 except discord.HTTPException:
                     pass
                 increment_user_track_count(self.guild.id, self.user_id)
+                tag_track(self.guild.id, track, self.user_id)
                 await player.play(track)
             else:
-                await player.queue.put_wait(track)
+                await add_tracks_fairly(player, [track], self.user_id, enabled=fair)
                 increment_user_track_count(self.guild.id, self.user_id)
                 try:
                     await self.search_msg.edit(
@@ -1139,7 +1411,6 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     guild = player.guild
     state = get_player_state(guild.id)
 
-    # Если это поздравительный трек ДР — после него надо вернуть старый
     is_birthday_track = state.get("birthday_playing", False)
 
     add_to_history(guild.id, track)
@@ -1197,23 +1468,19 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     channel_id = state.get("text_channel_id")
     channel = guild.get_channel(channel_id) if channel_id else None
 
-    # Если только что отыграл ДР-трек — восстанавливаем предыдущий
     if state.get("birthday_playing"):
         state["birthday_playing"] = False
         resume = state.pop("birthday_resume", None)
         if resume:
             try:
-                # Следующим в очереди уже должен лежать прежний трек
-                # (мы положили его вторым). Дожидаемся его старта и перематываем.
                 state["birthday_seek_to"] = resume["position"]
             except Exception as e:
                 log.warning("Birthday resume setup error: %s", e)
 
-    # Перемотка восстановленного трека на сохранённую позицию
     seek_to = state.get("birthday_seek_to")
     if seek_to is not None and not player.queue.is_empty:
         async def _seek_after_start():
-            await asyncio.sleep(0.8)  # даём треку реально стартовать
+            await asyncio.sleep(0.8)
             p: wavelink.Player = guild.voice_client
             if p and p.current:
                 try:
@@ -1256,13 +1523,11 @@ async def on_wavelink_node_ready(payload):
 
 
 # ─────────────────────────────────────────────
-#  День рождения + автовыход
+#  День рождения
 # ─────────────────────────────────────────────
 async def _play_birthday_now(member: discord.Member,
                               channel: discord.VoiceChannel,
                               birthday: dict):
-    """Играет поздравление. Если бот занят — прерывает текущий трек,
-    после поздравления возвращается к нему на той же позиции."""
     song_query = birthday.get("birthday_song") or "Happy Birthday instrumental"
     try:
         results = await wavelink.Playable.search(
@@ -1278,7 +1543,6 @@ async def _play_birthday_now(member: discord.Member,
     player: wavelink.Player = member.guild.voice_client
     state = get_player_state(member.guild.id)
 
-    # Определить текстовый канал для сообщения
     text_channel = None
     if state.get("text_channel_id"):
         text_channel = member.guild.get_channel(state["text_channel_id"])
@@ -1290,7 +1554,6 @@ async def _play_birthday_now(member: discord.Member,
                 text_channel = ch
                 break
 
-    # Случай 1: бот не в канале — подключаемся и играем поздравление
     if player is None or not player.connected:
         try:
             player = await channel.connect(cls=wavelink.Player)
@@ -1311,20 +1574,16 @@ async def _play_birthday_now(member: discord.Member,
             log.warning("Birthday play error: %s", e)
         return
 
-    # Случай 2: бот занят играет что-то в том же канале
     if player.channel != channel:
-        # В другом канале — не вмешиваемся
         return
 
     current_track = player.current
     if current_track is None:
-        # Нет текущего — просто ставим ДР-трек следующим
         await player.queue.put_wait(bday_track)
         if not player.playing:
             await player.play(player.queue.get())
         return
 
-    # Запоминаем что играло и где
     state["birthday_resume"] = {
         "uri": current_track.uri,
         "title": current_track.title,
@@ -1332,14 +1591,11 @@ async def _play_birthday_now(member: discord.Member,
     }
     state["birthday_playing"] = True
 
-    # Временно убираем loop чтобы прерванный трек не перезапустился
     prev_mode = player.queue.mode
     if prev_mode == wavelink.QueueMode.loop:
         player.queue.mode = wavelink.QueueMode.normal
 
-    # Вставляем: [0] ДР-трек, [1] прежний трек (для возврата)
     try:
-        # Resolve тот же трек заново — идентификатор на ноде нестабилен после skip
         resume_results = await wavelink.Playable.search(
             current_track.uri or current_track.title,
             source=wavelink.TrackSource.YouTube,
@@ -1349,13 +1605,11 @@ async def _play_birthday_now(member: discord.Member,
             resume_track = resume_results[0] if isinstance(resume_results, list) \
                 else resume_results.tracks[0]
 
-        # put_at доступен в современном wavelink; если нет — эмулируем через clear+rebuild
         try:
             player.queue.put_at(0, bday_track)
             if resume_track:
                 player.queue.put_at(1, resume_track)
         except AttributeError:
-            # Fallback: пересобираем очередь вручную
             current_queue = list(player.queue)
             player.queue.clear()
             await player.queue.put_wait(bday_track)
@@ -1364,10 +1618,7 @@ async def _play_birthday_now(member: discord.Member,
             for t in current_queue:
                 await player.queue.put_wait(t)
 
-        # Восстанавливаем режим повтора после обработки ДР
         state["birthday_prev_mode"] = prev_mode
-
-        # Переходим к ДР-треку
         await player.skip(force=True)
 
         if text_channel:
@@ -1394,7 +1645,6 @@ async def _handle_birthday(member: discord.Member, channel: discord.VoiceChannel
         return
     if not birthday or not is_birthday_today(birthday["birth_day"], birthday["birth_month"]):
         return
-    # Избегаем двойного срабатывания в тот же день — флаг в памяти на сутки
     state = get_player_state(member.guild.id)
     already = state.setdefault("birthday_greeted", set())
     if member.id in already:
@@ -1410,7 +1660,6 @@ async def on_voice_state_update(member: discord.Member,
     if member.bot:
         return
 
-    # Заход в канал — проверяем день рождения
     if after.channel and not before.channel:
         await _handle_birthday(member, after.channel)
 
@@ -1457,19 +1706,15 @@ async def on_voice_state_update(member: discord.Member,
 
 
 # ─────────────────────────────────────────────
-#  Определение источника по URL
+#  Определение источника
 # ─────────────────────────────────────────────
 def detect_source_from_url(query: str) -> wavelink.TrackSource:
-    """Автоопределение источника по ссылке."""
     q = query.lower()
     if "soundcloud.com" in q or q.startswith("sc:"):
         return wavelink.TrackSource.SoundCloud
     return wavelink.TrackSource.YouTube
 
 
-# ─────────────────────────────────────────────
-#  Slash-команды: воспроизведение
-# ─────────────────────────────────────────────
 async def ensure_voice_connection(
     interaction: discord.Interaction,
 ) -> Optional[wavelink.Player]:
@@ -1491,6 +1736,9 @@ async def ensure_voice_connection(
     return player
 
 
+# ─────────────────────────────────────────────
+#  Slash-команды: воспроизведение
+# ─────────────────────────────────────────────
 @tree.command(name="play", description="Поиск трека или добавление плейлиста")
 @app_commands.describe(query="Название, ссылка YouTube/SoundCloud/Spotify или плейлист")
 async def play_cmd(interaction: discord.Interaction, query: str):
@@ -1501,7 +1749,6 @@ async def play_cmd(interaction: discord.Interaction, query: str):
 
     msg = await interaction.followup.send(f"🔍 Ищу **{query[:100]}**...", wait=True)
 
-    # Автоопределение источника
     source = detect_source_from_url(query)
 
     try:
@@ -1510,7 +1757,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         log.warning("Search error: %s", e)
         results = None
 
-    # Fallback на Spotify через API, если Lavalink не смог
+    # Fallback на Spotify API
     if not results and "spotify.com" in query.lower():
         await msg.edit(content="🎵 Получаю треки из Spotify через API...")
         spotify_tracks = await fetch_spotify_tracks(query)
@@ -1530,7 +1777,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
             return
         await msg.edit(content=f"🔍 Ищу {len(limited_sp)} треков на YouTube...")
-        added = 0
+        added_tracks = []
         for sp in limited_sp:
             try:
                 sp_results = await wavelink.Playable.search(
@@ -1538,23 +1785,33 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                 )
                 if sp_results:
                     track = sp_results[0] if isinstance(sp_results, list) else sp_results.tracks[0]
-                    await player.queue.put_wait(track)
-                    added += 1
+                    added_tracks.append(track)
             except Exception as e:
                 log.debug("Spotify->YT search error: %s", e)
                 continue
-        if added == 0:
+        if not added_tracks:
             await msg.edit(content="😕 Не удалось найти треки на YouTube.")
             return
-        increment_user_track_count(interaction.guild_id, interaction.user.id, added)
+
+        fair = await get_fair_queue_enabled(interaction.guild_id)
         if not player.playing:
+            # Первый трек — сразу играть, остальные в очередь
+            first_track = added_tracks[0]
+            rest = added_tracks[1:]
+            tag_track(interaction.guild_id, first_track, interaction.user.id)
+            for t in rest:
+                tag_track(interaction.guild_id, t, interaction.user.id)
+            for t in rest:
+                await player.queue.put_wait(t)
             try:
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(player.queue.get())
+            await player.play(first_track)
         else:
-            await msg.edit(content=f"📋 Добавлено из Spotify: `{added} треков`")
+            await add_tracks_fairly(player, added_tracks, interaction.user.id, enabled=fair)
+            await msg.edit(content=f"📋 Добавлено из Spotify: `{len(added_tracks)} треков`")
+        increment_user_track_count(interaction.guild_id, interaction.user.id, len(added_tracks))
         return
 
     if not results:
@@ -1574,23 +1831,32 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         if player is None:
             await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
             return
-        for track in limited:
-            await player.queue.put_wait(track)
-        increment_user_track_count(interaction.guild_id, interaction.user.id, len(limited))
+
+        fair = await get_fair_queue_enabled(interaction.guild_id)
         count = len(limited)
         total = len(results.tracks)
         suffix = f" (лимит {PLAYLIST_TRACK_LIMIT})" if total > PLAYLIST_TRACK_LIMIT else ""
+
         if not player.playing:
+            first_track = limited[0]
+            rest = limited[1:]
+            tag_track(interaction.guild_id, first_track, interaction.user.id)
+            for t in rest:
+                tag_track(interaction.guild_id, t, interaction.user.id)
+            for t in rest:
+                await player.queue.put_wait(t)
             try:
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(player.queue.get())
+            await player.play(first_track)
         else:
+            await add_tracks_fairly(player, limited, interaction.user.id, enabled=fair)
             await msg.edit(
                 content=f"📋 **Плейлист добавлен:** {results.name} — `{count} треков`{suffix}",
                 view=None,
             )
+        increment_user_track_count(interaction.guild_id, interaction.user.id, count)
         return
 
     # Одиночная ссылка
@@ -1606,19 +1872,21 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
             return
         track = results[0]
-        await player.queue.put_wait(track)
-        increment_user_track_count(interaction.guild_id, interaction.user.id)
+        fair = await get_fair_queue_enabled(interaction.guild_id)
         if not player.playing:
+            tag_track(interaction.guild_id, track, interaction.user.id)
             try:
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(player.queue.get())
+            await player.play(track)
         else:
+            await add_tracks_fairly(player, [track], interaction.user.id, enabled=fair)
             await msg.edit(
                 content=f"➕ **Добавлено:** {track.title} `[{format_duration(track.length)}]`",
                 view=None,
             )
+        increment_user_track_count(interaction.guild_id, interaction.user.id)
         return
 
     # Обычный поиск
@@ -1679,7 +1947,7 @@ async def savequeue_cmd(interaction: discord.Interaction, name: str):
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды: управление плеером
+#  Управление плеером
 # ─────────────────────────────────────────────
 @tree.command(name="skip", description="Пропустить текущий трек")
 async def skip_cmd(interaction: discord.Interaction):
@@ -1869,18 +2137,19 @@ async def remove_cmd(interaction: discord.Interaction, position: int):
     await interaction.response.send_message(f"🗑 Удалено: **{removed.title}**")
 
 
-@tree.command(name="queue", description="Показать очередь")
-@app_commands.describe(count="Сколько треков показать (по умолчанию 15)")
-async def queue_cmd(interaction: discord.Interaction, count: Optional[int] = None):
+@tree.command(name="queue", description="Показать очередь с пагинацией")
+async def queue_cmd(interaction: discord.Interaction):
     player: wavelink.Player = interaction.guild.voice_client
     if not player or (not player.current and player.queue.is_empty):
         await interaction.response.send_message("📭 Очередь пуста.")
         return
-    if count is not None and count < 1:
-        await interaction.response.send_message("❗ Число должно быть положительным.", ephemeral=True)
-        return
-    text = build_queue_text(player, count)
-    await interaction.response.send_message(text, ephemeral=True)
+    view = QueuePaginationView(interaction.guild, interaction.user.id)
+    text = view.build_text()
+    await interaction.response.send_message(text, view=view, ephemeral=True)
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException:
+        pass
 
 
 @tree.command(name="nowplaying", description="Что сейчас играет")
@@ -1905,18 +2174,28 @@ async def lyrics_cmd(interaction: discord.Interaction):
         return
     await interaction.response.defer()
     title = player.current.title
-    lyrics = await fetch_lyrics(title)
-    if not lyrics:
+    duration = player.current.length
+
+    result = await fetch_lyrics(title, duration)
+    if not result or not result.get("text"):
+        sources = ["LRClib"]
+        if GENIUS_TOKEN:
+            sources.append("Genius")
+        sources.append("lyrics.ovh")
         await interaction.followup.send(
             f"😕 Текст для **{title}** не найден.\n"
-            f"_Попробуй переименовать трек в формат 'Артист - Название'_"
+            f"_Проверено: {', '.join(sources)}._\n"
+            f"_Если трек называется нестандартно, попробуй формат 'Артист - Название'_"
         )
         return
-    if len(lyrics) > LYRICS_MAX_CHARS:
-        lyrics = lyrics[:LYRICS_MAX_CHARS] + "\n_...продолжение текста обрезано_"
-    source = "Genius" if GENIUS_TOKEN else "lyrics.ovh"
+
+    text = result["text"]
+    if len(text) > LYRICS_MAX_CHARS:
+        text = text[:LYRICS_MAX_CHARS] + "\n_...продолжение текста обрезано_"
+
+    synced_mark = " 🎤" if result.get("synced") else ""
     await interaction.followup.send(
-        f"📝 **{title}** _(via {source})_\n\n{lyrics}"
+        f"📝 **{title}** _(via {result['source']}{synced_mark})_\n\n{text}"
     )
 
 
@@ -1954,7 +2233,7 @@ async def stats_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды: эффекты
+#  Эффекты
 # ─────────────────────────────────────────────
 EFFECT_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in EFFECTS.items()]
 
@@ -1983,7 +2262,7 @@ async def effect_cmd(interaction: discord.Interaction, effect: app_commands.Choi
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды: настройки сервера
+#  Настройки сервера
 # ─────────────────────────────────────────────
 settings_group = app_commands.Group(
     name="settings",
@@ -2014,6 +2293,11 @@ async def settings_show(interaction: discord.Interaction):
     embed.add_field(
         name="🎵 Лимит треков на пользователя",
         value=f"**{settings['track_limit']}** {'треков' if settings['track_limit'] > 0 else '(без лимита)'}",
+        inline=False
+    )
+    embed.add_field(
+        name="⚖️ Справедливая очередь",
+        value=f"{'✅ Включена' if settings.get('fair_queue') else '❌ Выключена'}",
         inline=False
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2086,11 +2370,33 @@ async def settings_tracklimit(interaction: discord.Interaction, limit: int):
         )
 
 
+@settings_group.command(name="fairqueue", description="Справедливая очередь (чередовать треки пользователей)")
+@app_commands.describe(enabled="Включить чередование")
+async def settings_fairqueue(interaction: discord.Interaction, enabled: bool):
+    if not db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    await db_save_settings(interaction.guild_id, fair_queue=enabled)
+    if enabled:
+        await interaction.response.send_message(
+            "⚖️ **Справедливая очередь включена.**\n"
+            "Когда кто-то добавляет плейлист, его треки чередуются "
+            "с треками других пользователей (через один).\n"
+            "_Одиночные треки добавляются как обычно._",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ Справедливая очередь выключена. Треки ставятся подряд.",
+            ephemeral=True,
+        )
+
+
 tree.add_command(settings_group)
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды: плейлисты
+#  Плейлисты
 # ─────────────────────────────────────────────
 playlist_group = app_commands.Group(name="playlist", description="Личные плейлисты")
 
@@ -2174,30 +2480,39 @@ async def pl_play(interaction: discord.Interaction, name: str):
         return
 
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
-    added = 0
+    loaded = []
     for t in tracks[:PLAYLIST_TRACK_LIMIT]:
         try:
             results = await wavelink.Playable.search(t["uri"])
             if results:
                 track = results[0] if isinstance(results, list) else results.tracks[0]
-                await player.queue.put_wait(track)
-                added += 1
+                loaded.append(track)
         except Exception as e:
             log.debug("Playlist track load error: %s", e)
             continue
 
-    if added == 0:
+    if not loaded:
         await msg.edit(content=f"😕 Не удалось загрузить треки из **{clean}**.")
         return
-    increment_user_track_count(interaction.guild_id, interaction.user.id, added)
+
+    fair = await get_fair_queue_enabled(interaction.guild_id)
     if not player.playing:
+        first = loaded[0]
+        rest = loaded[1:]
+        tag_track(interaction.guild_id, first, interaction.user.id)
+        for t in rest:
+            tag_track(interaction.guild_id, t, interaction.user.id)
+        for t in rest:
+            await player.queue.put_wait(t)
         try:
             await msg.delete()
         except discord.HTTPException:
             pass
-        await player.play(player.queue.get())
+        await player.play(first)
     else:
-        await msg.edit(content=f"📋 **{clean}** добавлен — `{added} треков`")
+        await add_tracks_fairly(player, loaded, interaction.user.id, enabled=fair)
+        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`")
+    increment_user_track_count(interaction.guild_id, interaction.user.id, len(loaded))
 
 
 @playlist_group.command(name="delete", description="Удалить плейлист")
@@ -2280,7 +2595,7 @@ tree.add_command(playlist_group)
 
 
 # ─────────────────────────────────────────────
-#  Slash-команды: день рождения
+#  День рождения
 # ─────────────────────────────────────────────
 birthday_group = app_commands.Group(name="birthday", description="День рождения")
 
@@ -2295,7 +2610,7 @@ async def birthday_set(interaction: discord.Interaction, day: int, month: int):
         await interaction.response.send_message("❗ Неверная дата.", ephemeral=True)
         return
     try:
-        datetime.date(2024, month, day)  # 2024 — високосный, принимает 29 февраля
+        datetime.date(2024, month, day)
     except ValueError:
         await interaction.response.send_message("❗ Такой даты не существует.", ephemeral=True)
         return
@@ -2371,7 +2686,7 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False
     )
     embed.add_field(name="📋 Очередь", value=
-        "`/queue [кол-во]` — показать очередь\n"
+        "`/queue` — показать очередь с пагинацией\n"
         "`/nowplaying` — текущий трек\n"
         "`/remove <номер>` — убрать трек\n"
         "`/history` — история\n"
@@ -2388,7 +2703,8 @@ async def help_cmd(interaction: discord.Interaction):
         "`/settings djrole <роль>` — DJ-роль\n"
         "`/settings djrole_remove` — убрать DJ-роль\n"
         "`/settings voteskip <вкл/выкл> [%]` — голосование\n"
-        "`/settings tracklimit <число>` — лимит треков",
+        "`/settings tracklimit <число>` — лимит треков\n"
+        "`/settings fairqueue <вкл/выкл>` — справедливая очередь",
         inline=False
     )
     embed.add_field(name="🎂 День рождения", value=
@@ -2419,14 +2735,12 @@ async def on_app_command_error(interaction: discord.Interaction,
 
 
 # ─────────────────────────────────────────────
-#  Фоновая задача сброса флага "уже поздравлен"
+#  Фоновые задачи
 # ─────────────────────────────────────────────
 async def reset_birthday_flags_daily():
-    """Раз в сутки (в 00:05 МСК) очищает флаг "уже поздравлен" у всех серверов."""
     while True:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         moscow = now_utc + datetime.timedelta(hours=3)
-        # Время следующего 00:05 МСК
         next_run = moscow.replace(hour=0, minute=5, second=0, microsecond=0)
         if next_run <= moscow:
             next_run += datetime.timedelta(days=1)
@@ -2474,7 +2788,6 @@ async def on_ready():
     except Exception as e:
         log.error("tree.sync error: %s", e)
 
-    # Фоновый таск сброса флагов ДР
     bot.loop.create_task(reset_birthday_flags_daily())
 
     await bot.change_presence(activity=discord.Activity(

@@ -26,6 +26,17 @@ logging.basicConfig(
 log = logging.getLogger("surge")
 
 # ─────────────────────────────────────────────
+#  Опциональный импорт Яндекс.Музыки
+# ─────────────────────────────────────────────
+try:
+    from yandex_music import ClientAsync as YMClient
+    YANDEX_MUSIC_AVAILABLE = True
+except ImportError:
+    YANDEX_MUSIC_AVAILABLE = False
+    YMClient = None
+    log.warning("yandex-music не установлен — Я.М ссылки обрабатываться не будут")
+
+# ─────────────────────────────────────────────
 #  Конфигурация
 # ─────────────────────────────────────────────
 DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
@@ -532,6 +543,109 @@ async def fetch_spotify_tracks(url: str) -> Optional[list]:
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("Spotify fetch error: %s", e)
         return None
+    return tracks or None
+
+
+# ─────────────────────────────────────────────
+#  Яндекс.Музыка (без токена)
+# ─────────────────────────────────────────────
+_ym_client = None
+
+
+async def get_ym_client():
+    """Ленивая инициализация клиента Я.М без токена."""
+    global _ym_client
+    if not YANDEX_MUSIC_AVAILABLE:
+        return None
+    if _ym_client is not None:
+        return _ym_client
+    try:
+        _ym_client = await YMClient().init()
+        log.info("Yandex.Music клиент инициализирован")
+        return _ym_client
+    except Exception as e:
+        log.warning("Yandex.Music init error: %s", e)
+        return None
+
+
+def parse_yandex_music_url(url: str) -> Optional[dict]:
+    """Парсит ссылку Я.М: track / album / playlist."""
+    # Трек в альбоме: /album/12345/track/67890
+    m = re.search(r'music\.yandex\.(?:ru|com|by|kz)/album/(\d+)/track/(\d+)', url)
+    if m:
+        return {"type": "track", "track_id": m.group(2), "album_id": m.group(1)}
+
+    # Короткий трек: /track/67890
+    m = re.search(r'music\.yandex\.(?:ru|com|by|kz)/track/(\d+)', url)
+    if m:
+        return {"type": "track", "track_id": m.group(1)}
+
+    # Альбом: /album/12345
+    m = re.search(r'music\.yandex\.(?:ru|com|by|kz)/album/(\d+)(?:$|[/?#])', url)
+    if m:
+        return {"type": "album", "album_id": m.group(1)}
+
+    # Плейлист: /users/USERNAME/playlists/3
+    m = re.search(r'music\.yandex\.(?:ru|com|by|kz)/users/([^/]+)/playlists/(\d+)', url)
+    if m:
+        return {"type": "playlist", "owner": m.group(1), "kind": m.group(2)}
+
+    return None
+
+
+async def fetch_yandex_tracks(url: str) -> Optional[list]:
+    """Получает метаданные треков из Я.М. Возвращает [{title, artist}]."""
+    parsed = parse_yandex_music_url(url)
+    if not parsed:
+        return None
+
+    client = await get_ym_client()
+    if not client:
+        return None
+
+    tracks = []
+    try:
+        if parsed["type"] == "track":
+            track_id = parsed["track_id"]
+            result = await client.tracks([track_id])
+            if result and len(result) > 0:
+                t = result[0]
+                if t and t.title and t.artists:
+                    tracks.append({
+                        "title": t.title,
+                        "artist": t.artists[0].name,
+                    })
+
+        elif parsed["type"] == "album":
+            album = await client.albums_with_tracks(parsed["album_id"])
+            if album and album.volumes:
+                all_tracks = []
+                for volume in album.volumes:
+                    all_tracks.extend(volume)
+                for t in all_tracks[:SPOTIFY_TRACK_LIMIT]:
+                    if t and t.title and t.artists:
+                        tracks.append({
+                            "title": t.title,
+                            "artist": t.artists[0].name,
+                        })
+
+        elif parsed["type"] == "playlist":
+            playlist = await client.users_playlists(
+                kind=parsed["kind"], user_id=parsed["owner"]
+            )
+            if playlist and playlist.tracks:
+                for short_track in playlist.tracks[:SPOTIFY_TRACK_LIMIT]:
+                    t = short_track.track
+                    if t and t.title and t.artists:
+                        tracks.append({
+                            "title": t.title,
+                            "artist": t.artists[0].name,
+                        })
+
+    except Exception as e:
+        log.warning("Yandex.Music fetch error: %s", e)
+        return None
+
     return tracks or None
 
 
@@ -1757,6 +1871,92 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         log.warning("Search error: %s", e)
         results = None
 
+    # Яндекс.Музыка — свой обработчик (Lavalink не поддерживает Я.М)
+    if not results and "music.yandex." in query.lower():
+        if not YANDEX_MUSIC_AVAILABLE:
+            await msg.edit(
+                content="❗ Поддержка Яндекс.Музыки не установлена.\n"
+                        "_Обратись к администратору бота._"
+            )
+            return
+        await msg.edit(content="🎵 Получаю треки из Яндекс.Музыки...")
+        ym_tracks = await fetch_yandex_tracks(query)
+        if not ym_tracks:
+            await msg.edit(
+                content="❗ Не удалось получить треки из Я.М.\n"
+                        "_Возможно, ссылка неверная или трек недоступен._"
+            )
+            return
+
+        limited_ym = ym_tracks[:PLAYLIST_TRACK_LIMIT]
+        if not await check_track_limit(interaction, len(limited_ym)):
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            return
+        player = await ensure_voice_connection(interaction)
+        if player is None:
+            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            return
+
+        if len(limited_ym) == 1:
+            await msg.edit(content=f"🔍 Ищу трек на YouTube...")
+        else:
+            await msg.edit(content=f"🔍 Ищу {len(limited_ym)} треков на YouTube...")
+
+        added_tracks = []
+        for ym in limited_ym:
+            try:
+                yt_results = await wavelink.Playable.search(
+                    f"{ym['artist']} - {ym['title']}",
+                    source=wavelink.TrackSource.YouTube,
+                )
+                if yt_results:
+                    track = yt_results[0] if isinstance(yt_results, list) \
+                        else yt_results.tracks[0]
+                    added_tracks.append(track)
+            except Exception as e:
+                log.debug("Yandex->YT search error: %s", e)
+                continue
+
+        if not added_tracks:
+            await msg.edit(content="😕 Не удалось найти треки на YouTube.")
+            return
+
+        fair = await get_fair_queue_enabled(interaction.guild_id)
+        if not player.playing:
+            first_track = added_tracks[0]
+            rest = added_tracks[1:]
+            tag_track(interaction.guild_id, first_track, interaction.user.id)
+            for t in rest:
+                tag_track(interaction.guild_id, t, interaction.user.id)
+            for t in rest:
+                await player.queue.put_wait(t)
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            await player.play(first_track)
+        else:
+            await add_tracks_fairly(
+                player, added_tracks, interaction.user.id, enabled=fair
+            )
+            if len(added_tracks) == 1:
+                await msg.edit(
+                    content=f"➕ **Добавлено из Я.М:** {added_tracks[0].title} "
+                            f"`[{format_duration(added_tracks[0].length)}]`",
+                    view=None,
+                )
+            else:
+                await msg.edit(
+                    content=f"📋 Добавлено из Яндекс.Музыки: `{len(added_tracks)} треков`"
+                )
+        increment_user_track_count(
+            interaction.guild_id, interaction.user.id, len(added_tracks)
+        )
+        return
+
     # Fallback на Spotify API
     if not results and "spotify.com" in query.lower():
         await msg.edit(content="🎵 Получаю треки из Spotify через API...")
@@ -2668,7 +2868,7 @@ tree.add_command(birthday_group)
 async def help_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title=f"🎵 {BOT_NAME} — Команды", color=discord.Color.blurple())
     embed.add_field(name="▶️ Воспроизведение", value=
-        "`/play <запрос>` — YouTube, SoundCloud или Spotify (автоопределение)\n"
+        "`/play <запрос>` — YouTube, SoundCloud, Spotify, Я.Музыка (автоопределение)\n"
         "`/skip` — пропустить (или начать голосование)\n"
         "`/skipto <номер>` — перейти к треку\n"
         "`/forward <сек>` — перемотать вперёд\n"

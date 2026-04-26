@@ -1745,7 +1745,6 @@ async def search_with_node_fallback(
     if not nodes:
         return None, Exception("Нет доступных Lavalink-нод")
 
-    # Сортируем: сначала те что connected
     nodes = sorted(
         nodes,
         key=lambda n: 0 if n.status == wavelink.NodeStatus.CONNECTED else 1
@@ -1759,7 +1758,6 @@ async def search_with_node_fallback(
                 if i > 0:
                     log.info("Поиск удался на ноде #%d (%s)", i + 1, node.uri)
                 return results, None
-            # Пустой результат — не ошибка, идём дальше
             last_error = None
         except Exception as e:
             log.warning("Search error на ноде %s: %s", node.uri, e)
@@ -1767,6 +1765,63 @@ async def search_with_node_fallback(
             continue
 
     return None, last_error
+
+
+def parse_youtube_playlist_id(url: str) -> Optional[str]:
+    """Извлекает ID плейлиста YouTube из ссылки."""
+    m = re.search(r'[?&]list=([A-Za-z0-9_-]+)', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def fetch_youtube_playlist_video_ids(playlist_id: str, limit: int = 200) -> Optional[list]:
+    """
+    Получает video_id из YouTube-плейлиста через парсинг публичной страницы.
+    Без YouTube API ключа.
+
+    Возвращает список video_id или None при ошибке.
+    """
+    url = f"https://www.youtube.com/playlist?list={playlist_id}"
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        ) as s:
+            async with s.get(url) as r:
+                if r.status != 200:
+                    log.warning("YT playlist HTTP %s", r.status)
+                    return None
+                html = await r.text()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("YT playlist fetch error: %s", e)
+        return None
+
+    # Видео-ID на странице плейлиста встречаются в нескольких местах.
+    # Самый надёжный способ — найти все уникальные videoId в JSON-данных страницы.
+    video_ids = []
+    seen = set()
+    for match in re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})"', html):
+        vid = match.group(1)
+        if vid not in seen:
+            seen.add(vid)
+            video_ids.append(vid)
+            if len(video_ids) >= limit:
+                break
+
+    if not video_ids:
+        log.warning("YT playlist: не нашли ни одного videoId")
+        return None
+
+    log.info("YT playlist: нашли %d видео", len(video_ids))
+    return video_ids
 
 
 async def ensure_voice_connection(
@@ -1809,6 +1864,72 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     results, search_error = await search_with_node_fallback(query, source)
     if search_error:
         log.warning("Все ноды дали ошибку при поиске: %s", search_error)
+
+    # YouTube playlist fallback: если это ссылка на YT-плейлист и поиск упал
+    # (классическая ошибка Lavalink при загрузке плейлистов), грузим вручную:
+    # парсим страницу плейлиста YouTube → получаем video_id → ищем каждый трек
+    yt_playlist_id = None
+    if not results and ("youtube.com" in query.lower() or "youtu.be" in query.lower()):
+        yt_playlist_id = parse_youtube_playlist_id(query)
+
+    if yt_playlist_id:
+        await msg.edit(content="📋 Получаю список треков из YouTube-плейлиста...")
+        video_ids = await fetch_youtube_playlist_video_ids(
+            yt_playlist_id, limit=PLAYLIST_TRACK_LIMIT
+        )
+        if not video_ids:
+            await msg.edit(
+                content="❗ Не удалось загрузить YouTube-плейлист.\n"
+                        "_Возможно, он приватный или удалён._"
+            )
+            return
+
+        if not await check_track_limit(interaction, len(video_ids)):
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            return
+
+        player = await ensure_voice_connection(interaction)
+        if player is None:
+            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            return
+
+        await msg.edit(content=f"🔍 Загружаю {len(video_ids)} треков...")
+        added_tracks = []
+        for vid in video_ids:
+            video_url = f"https://www.youtube.com/watch?v={vid}"
+            yt_results, _ = await search_with_node_fallback(
+                video_url, wavelink.TrackSource.YouTube
+            )
+            if yt_results:
+                track = yt_results[0] if isinstance(yt_results, list) else yt_results.tracks[0]
+                added_tracks.append(track)
+
+        if not added_tracks:
+            await msg.edit(content="😕 Не удалось загрузить ни одного трека из плейлиста.")
+            return
+
+        fair = await get_fair_queue_enabled(interaction.guild_id)
+        if not player.playing:
+            first_track = added_tracks[0]
+            rest = added_tracks[1:]
+            tag_track(interaction.guild_id, first_track, interaction.user.id)
+            for t in rest:
+                tag_track(interaction.guild_id, t, interaction.user.id)
+            for t in rest:
+                await player.queue.put_wait(t)
+            try:
+                await msg.delete()
+            except discord.HTTPException:
+                pass
+            await player.play(first_track)
+        else:
+            await add_tracks_fairly(player, added_tracks, interaction.user.id, enabled=fair)
+            await msg.edit(content=f"📋 Добавлено из YT-плейлиста: `{len(added_tracks)} треков`")
+        increment_user_track_count(interaction.guild_id, interaction.user.id, len(added_tracks))
+        return
 
     # Яндекс.Музыка не поддерживается (Lavalink её не знает, а прямой API
     # Яндекса блокирует все запросы извне РФ по HTTP 451)
@@ -1880,16 +2001,33 @@ async def play_cmd(interaction: discord.Interaction, query: str):
 
     if not results:
         if search_error:
-            # Ошибка ноды, а не "трек не найден"
-            await msg.edit(
-                content="⚠️ **Lavalink-нода временно недоступна.**\n"
-                        "_Это бывает с публичными нодами — YouTube периодически "
-                        "блокирует их или они уходят на обслуживание._\n\n"
-                        "💡 Попробуй:\n"
-                        "• Повторить через 30-60 секунд\n"
-                        "• Использовать прямую ссылку (YouTube/Spotify)\n"
-                        "• Если не работает 5+ минут — скинь админу логи"
+            err_str = str(search_error).lower()
+            # Часто бывает что для одиночных треков всё ок, а для плейлистов
+            # ломается из-за бага YouTube source плагина
+            is_likely_playlist_bug = (
+                "list=" in query.lower()
+                or "timestamp" in err_str
+                or "playlist" in err_str
             )
+            if is_likely_playlist_bug:
+                await msg.edit(
+                    content="⚠️ **Не получилось загрузить плейлист.**\n"
+                            "_Бесплатные Lavalink-ноды часто не справляются с YT-плейлистами._\n\n"
+                            "💡 Попробуй:\n"
+                            "• Скинуть ссылку на конкретное видео\n"
+                            "• Использовать Spotify-плейлист\n"
+                            "• Повторить через 1-2 минуты"
+                )
+            else:
+                await msg.edit(
+                    content="⚠️ **Lavalink-нода временно недоступна.**\n"
+                            "_Это бывает с публичными нодами — YouTube периодически "
+                            "блокирует их или они уходят на обслуживание._\n\n"
+                            "💡 Попробуй:\n"
+                            "• Повторить через 30-60 секунд\n"
+                            "• Использовать прямую ссылку (YouTube/Spotify)\n"
+                            "• Если не работает 5+ минут — скинь админу логи"
+                )
         else:
             await msg.edit(content="😕 Ничего не найдено.")
         return

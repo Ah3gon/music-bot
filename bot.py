@@ -1543,13 +1543,11 @@ async def _play_birthday_now(member: discord.Member,
                               channel: discord.VoiceChannel,
                               birthday: dict):
     song_query = birthday.get("birthday_song") or "Happy Birthday instrumental"
-    try:
-        results = await wavelink.Playable.search(
-            song_query, source=wavelink.TrackSource.YouTube
-        )
-    except Exception as e:
-        log.warning("Birthday search error: %s", e)
-        return
+    results, err = await search_with_node_fallback(
+        song_query, wavelink.TrackSource.YouTube
+    )
+    if err:
+        log.warning("Birthday search error: %s", err)
     if not results:
         return
     bday_track = results[0] if isinstance(results, list) else results.tracks[0]
@@ -1610,9 +1608,9 @@ async def _play_birthday_now(member: discord.Member,
         player.queue.mode = wavelink.QueueMode.normal
 
     try:
-        resume_results = await wavelink.Playable.search(
+        resume_results, _ = await search_with_node_fallback(
             current_track.uri or current_track.title,
-            source=wavelink.TrackSource.YouTube,
+            wavelink.TrackSource.YouTube,
         )
         resume_track = None
         if resume_results:
@@ -1729,6 +1727,48 @@ def detect_source_from_url(query: str) -> wavelink.TrackSource:
     return wavelink.TrackSource.YouTube
 
 
+async def search_with_node_fallback(
+    query: str,
+    source: wavelink.TrackSource,
+    max_nodes: int = 3,
+):
+    """
+    Ищет трек, перебирая разные Lavalink-ноды если первая дала ошибку.
+
+    Wavelink сам выбирает ноду через Pool, но не переключается при ошибках
+    типа "Failed to Load Tracks" (когда YouTube банит конкретную ноду).
+    Эта функция перебирает доступные ноды вручную.
+
+    Возвращает (results, last_error).
+    """
+    nodes = list(wavelink.Pool.nodes.values())
+    if not nodes:
+        return None, Exception("Нет доступных Lavalink-нод")
+
+    # Сортируем: сначала те что connected
+    nodes = sorted(
+        nodes,
+        key=lambda n: 0 if n.status == wavelink.NodeStatus.CONNECTED else 1
+    )[:max_nodes]
+
+    last_error = None
+    for i, node in enumerate(nodes):
+        try:
+            results = await wavelink.Playable.search(query, source=source, node=node)
+            if results:
+                if i > 0:
+                    log.info("Поиск удался на ноде #%d (%s)", i + 1, node.uri)
+                return results, None
+            # Пустой результат — не ошибка, идём дальше
+            last_error = None
+        except Exception as e:
+            log.warning("Search error на ноде %s: %s", node.uri, e)
+            last_error = e
+            continue
+
+    return None, last_error
+
+
 async def ensure_voice_connection(
     interaction: discord.Interaction,
 ) -> Optional[wavelink.Player]:
@@ -1766,21 +1806,9 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     source = detect_source_from_url(query)
     search_error = None
 
-    try:
-        results = await wavelink.Playable.search(query, source=source)
-    except Exception as e:
-        log.warning("Search error: %s", e)
-        results = None
-        search_error = str(e)
-        # Пробуем ещё раз, на случай временного сбоя ноды
-        try:
-            await asyncio.sleep(1)
-            results = await wavelink.Playable.search(query, source=source)
-            if results:
-                log.info("Search succeeded on retry")
-                search_error = None
-        except Exception as e2:
-            log.warning("Search retry also failed: %s", e2)
+    results, search_error = await search_with_node_fallback(query, source)
+    if search_error:
+        log.warning("Все ноды дали ошибку при поиске: %s", search_error)
 
     # Яндекс.Музыка не поддерживается (Lavalink её не знает, а прямой API
     # Яндекса блокирует все запросы извне РФ по HTTP 451)
@@ -1818,16 +1846,13 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await msg.edit(content=f"🔍 Ищу {len(limited_sp)} треков на YouTube...")
         added_tracks = []
         for sp in limited_sp:
-            try:
-                sp_results = await wavelink.Playable.search(
-                    f"{sp['artist']} - {sp['title']}", source=wavelink.TrackSource.YouTube
-                )
-                if sp_results:
-                    track = sp_results[0] if isinstance(sp_results, list) else sp_results.tracks[0]
-                    added_tracks.append(track)
-            except Exception as e:
-                log.debug("Spotify->YT search error: %s", e)
-                continue
+            sp_results, _ = await search_with_node_fallback(
+                f"{sp['artist']} - {sp['title']}",
+                wavelink.TrackSource.YouTube,
+            )
+            if sp_results:
+                track = sp_results[0] if isinstance(sp_results, list) else sp_results.tracks[0]
+                added_tracks.append(track)
         if not added_tracks:
             await msg.edit(content="😕 Не удалось найти треки на YouTube.")
             return
@@ -2533,14 +2558,12 @@ async def pl_play(interaction: discord.Interaction, name: str):
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
     loaded = []
     for t in tracks[:PLAYLIST_TRACK_LIMIT]:
-        try:
-            results = await wavelink.Playable.search(t["uri"])
-            if results:
-                track = results[0] if isinstance(results, list) else results.tracks[0]
-                loaded.append(track)
-        except Exception as e:
-            log.debug("Playlist track load error: %s", e)
-            continue
+        results, _ = await search_with_node_fallback(
+            t["uri"], wavelink.TrackSource.YouTube
+        )
+        if results:
+            track = results[0] if isinstance(results, list) else results.tracks[0]
+            loaded.append(track)
 
     if not loaded:
         await msg.edit(content=f"😕 Не удалось загрузить треки из **{clean}**.")

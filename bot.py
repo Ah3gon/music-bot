@@ -1019,6 +1019,13 @@ class QueuePaginationView(discord.ui.View):
         self.current_page = 0
         self.message: Optional[discord.Message] = None
 
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception, item: discord.ui.Item):
+        if isinstance(error, discord.NotFound):
+            log.debug("Протухшая кнопка пагинации очереди")
+            return
+        log.error("QueuePaginationView error: %s", error, exc_info=True)
+
     @property
     def player(self) -> Optional[wavelink.Player]:
         return self.guild.voice_client
@@ -1155,6 +1162,21 @@ class PlayerControls(discord.ui.View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=None)
         self.guild = guild
+
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception, item: discord.ui.Item):
+        """Перехватываем 404 Unknown interaction (протухшие кнопки)."""
+        if isinstance(error, discord.NotFound):
+            log.debug("Протухшая кнопка нажата (NotFound): %s", item)
+            return
+        log.error("PlayerControls button error: %s", error, exc_info=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❗ Ошибка кнопки. Попробуй позже.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
 
     @property
     def player(self) -> Optional[wavelink.Player]:
@@ -1340,6 +1362,13 @@ class TrackSelectView(discord.ui.View):
         cancel.callback = self._cancel
         self.add_item(cancel)
 
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception, item: discord.ui.Item):
+        if isinstance(error, discord.NotFound):
+            log.debug("Протухшая кнопка выбора трека")
+            return
+        log.error("TrackSelectView error: %s", error, exc_info=True)
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
@@ -1498,21 +1527,45 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         asyncio.create_task(_seek_after_start())
 
     if player.queue.mode == wavelink.QueueMode.loop:
-        try:
-            await player.play(payload.track)
-        except Exception as e:
-            log.warning("Loop replay error: %s", e)
+        ok = await safe_play_track(player, payload.track)
+        if not ok:
+            log.warning("Не удалось перезапустить трек в loop, выключаю режим")
+            player.queue.mode = wavelink.QueueMode.normal
+            # Пытаемся продолжить с очереди
+            if not player.queue.is_empty:
+                next_track = player.queue.get()
+                await safe_play_track(player, next_track)
         return
     if player.queue.mode == wavelink.QueueMode.loop_all:
         try:
             await player.queue.put_wait(payload.track)
         except Exception:
             pass
+
     if not player.queue.is_empty:
-        try:
-            await player.play(player.queue.get())
-        except Exception as e:
-            log.warning("Next track play error: %s", e)
+        # Пробуем запустить следующие треки. Если первый не запустился,
+        # пробуем второй, третий и т.д. — на случай "битых" треков
+        max_skip_attempts = 3
+        for skip_attempt in range(max_skip_attempts):
+            if player.queue.is_empty:
+                break
+            next_track = player.queue.get()
+            ok = await safe_play_track(player, next_track)
+            if ok:
+                break
+            log.warning("Трек '%s' не запустился, пробую следующий", next_track.title)
+        else:
+            log.error("Не смог запустить ни один из %d следующих треков",
+                      max_skip_attempts)
+            if channel:
+                try:
+                    await channel.send(
+                        "⚠️ Lavalink-нода вернулась с ошибкой.\n"
+                        "_Попробуй `/play <трек>` чтобы перезапустить плеер._"
+                    )
+                except discord.HTTPException:
+                    pass
+                await start_idle_timer(guild, channel)
     elif channel:
         await start_idle_timer(guild, channel)
 
@@ -1534,6 +1587,43 @@ async def on_wavelink_node_disconnected(payload):
     """Сообщение в логах когда нода падает — поможет понять какие ноды надёжные."""
     node = getattr(payload, "node", None)
     log.warning("Lavalink node disconnected: %s", node)
+
+
+@bot.event
+async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
+    """Трек упал с ошибкой во время игры — попробуем перейти к следующему."""
+    player = payload.player
+    if not player:
+        return
+    track = payload.track
+    log.warning("Track exception: %s — '%s'",
+                getattr(payload, "exception", "?"),
+                track.title if track else "?")
+    # Wavelink сам должен вызвать track_end после exception, но на всякий случай
+    # пробуем запустить следующий
+    if player.queue.is_empty:
+        return
+    if player.playing:
+        return  # уже играет что-то
+    next_track = player.queue.get()
+    ok = await safe_play_track(player, next_track)
+    if not ok:
+        log.error("Не смог продолжить очередь после track exception")
+
+
+@bot.event
+async def on_wavelink_track_stuck(payload):
+    """Трек завис (>10 сек без прогресса). Принудительно переходим дальше."""
+    player = payload.player
+    if not player:
+        return
+    log.warning("Track stuck — пропускаю и иду к следующему")
+    try:
+        if player.queue.mode == wavelink.QueueMode.loop:
+            player.queue.mode = wavelink.QueueMode.normal
+        await player.skip(force=True)
+    except Exception as e:
+        log.warning("Stuck skip error: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -1725,6 +1815,45 @@ def detect_source_from_url(query: str) -> wavelink.TrackSource:
     if "soundcloud.com" in q or q.startswith("sc:"):
         return wavelink.TrackSource.SoundCloud
     return wavelink.TrackSource.YouTube
+
+
+async def safe_play_track(
+    player: wavelink.Player,
+    track,
+    retries: int = 3,
+) -> bool:
+    """
+    Безопасно запускает трек с повтором при ошибках.
+    Возвращает True при успехе, False если все попытки провалились.
+    """
+    last_error = None
+    for attempt in range(retries):
+        try:
+            await player.play(track)
+            return True
+        except wavelink.LavalinkException as e:
+            err_str = str(e).lower()
+            last_error = e
+            # 404 — нода забыла про player'а. Wavelink сам пересоздаст
+            # при следующем play, надо подождать и повторить
+            if "status=404" in err_str or "not found" in err_str:
+                log.warning("Lavalink 404 при play (попытка %d/%d), жду 1 сек",
+                            attempt + 1, retries)
+                await asyncio.sleep(1)
+                continue
+            # Другая Lavalink-ошибка — тоже пробуем ещё
+            log.warning("LavalinkException при play (попытка %d/%d): %s",
+                        attempt + 1, retries, e)
+            await asyncio.sleep(0.5 * (attempt + 1))
+            continue
+        except Exception as e:
+            last_error = e
+            log.warning("Play error (попытка %d/%d): %s", attempt + 1, retries, e)
+            await asyncio.sleep(0.5 * (attempt + 1))
+            continue
+
+    log.error("Не удалось запустить трек после %d попыток: %s", retries, last_error)
+    return False
 
 
 async def search_with_node_fallback(
@@ -1924,7 +2053,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(first_track)
+            await safe_play_track(player, first_track)
         else:
             await add_tracks_fairly(player, added_tracks, interaction.user.id, enabled=fair)
             await msg.edit(content=f"📋 Добавлено из YT-плейлиста: `{len(added_tracks)} треков`")
@@ -1992,7 +2121,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(first_track)
+            await safe_play_track(player, first_track)
         else:
             await add_tracks_fairly(player, added_tracks, interaction.user.id, enabled=fair)
             await msg.edit(content=f"📋 Добавлено из Spotify: `{len(added_tracks)} треков`")
@@ -2063,7 +2192,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                 await msg.delete()
             except discord.HTTPException:
                 pass
-            await player.play(first_track)
+            await safe_play_track(player, first_track)
         else:
             await add_tracks_fairly(player, limited, interaction.user.id, enabled=fair)
             await msg.edit(
@@ -2720,7 +2849,7 @@ async def pl_play(interaction: discord.Interaction, name: str):
             await msg.delete()
         except discord.HTTPException:
             pass
-        await player.play(first)
+        await safe_play_track(player, first)
     else:
         await add_tracks_fairly(player, loaded, interaction.user.id, enabled=fair)
         await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`")

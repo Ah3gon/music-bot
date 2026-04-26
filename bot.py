@@ -56,8 +56,15 @@ EFFECTS = {
 }
 
 NODES = [
+    # Список публичных Lavalink-нод. Wavelink автоматически выбирает рабочую,
+    # при падении одной — переключается на следующую.
+    # Актуальные ноды: https://lavalink-list.darrennathanael.com
+    # Если нода не работает — закомментируй её через #
     {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
     {"uri": "http://n3.nexcloud.in:2026",       "password": "nexcloud"},
+    {"uri": "http://lavalink.triniumhost.com:2333", "password": "kirito"},
+    {"uri": "http://lavalink.triniumhost.com:4333", "password": "free"},
+    {"uri": "https://lavalink-v4.triniumhost.com:443", "password": "free"},
 ]
 
 MAX_INT32 = 2147483647
@@ -1522,6 +1529,13 @@ async def on_wavelink_node_ready(payload):
     log.info("Lavalink node ready: %s", getattr(payload, "node", "?"))
 
 
+@bot.event
+async def on_wavelink_node_disconnected(payload):
+    """Сообщение в логах когда нода падает — поможет понять какие ноды надёжные."""
+    node = getattr(payload, "node", None)
+    log.warning("Lavalink node disconnected: %s", node)
+
+
 # ─────────────────────────────────────────────
 #  День рождения
 # ─────────────────────────────────────────────
@@ -1750,12 +1764,23 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     msg = await interaction.followup.send(f"🔍 Ищу **{query[:100]}**...", wait=True)
 
     source = detect_source_from_url(query)
+    search_error = None
 
     try:
         results = await wavelink.Playable.search(query, source=source)
     except Exception as e:
         log.warning("Search error: %s", e)
         results = None
+        search_error = str(e)
+        # Пробуем ещё раз, на случай временного сбоя ноды
+        try:
+            await asyncio.sleep(1)
+            results = await wavelink.Playable.search(query, source=source)
+            if results:
+                log.info("Search succeeded on retry")
+                search_error = None
+        except Exception as e2:
+            log.warning("Search retry also failed: %s", e2)
 
     # Яндекс.Музыка не поддерживается (Lavalink её не знает, а прямой API
     # Яндекса блокирует все запросы извне РФ по HTTP 451)
@@ -1829,7 +1854,19 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         return
 
     if not results:
-        await msg.edit(content="😕 Ничего не найдено.")
+        if search_error:
+            # Ошибка ноды, а не "трек не найден"
+            await msg.edit(
+                content="⚠️ **Lavalink-нода временно недоступна.**\n"
+                        "_Это бывает с публичными нодами — YouTube периодически "
+                        "блокирует их или они уходят на обслуживание._\n\n"
+                        "💡 Попробуй:\n"
+                        "• Повторить через 30-60 секунд\n"
+                        "• Использовать прямую ссылку (YouTube/Spotify)\n"
+                        "• Если не работает 5+ минут — скинь админу логи"
+            )
+        else:
+            await msg.edit(content="😕 Ничего не найдено.")
         return
 
     # Плейлист
@@ -2792,7 +2829,7 @@ async def on_ready():
     nodes = [wavelink.Node(**n) for n in NODES]
     try:
         await wavelink.Pool.connect(nodes=nodes, client=bot)
-        log.info("Подключение к Lavalink инициировано")
+        log.info("Подключение к %d Lavalink-нодам инициировано", len(nodes))
     except Exception as e:
         log.error("Lavalink connect error: %s", e)
 

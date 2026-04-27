@@ -35,8 +35,8 @@ SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 GENIUS_TOKEN          = os.getenv("GENIUS_TOKEN", "")
 IDLE_TIMEOUT          = 300
 EMPTY_CH_TIMEOUT      = 60
-SPOTIFY_TRACK_LIMIT   = 200
-PLAYLIST_TRACK_LIMIT  = 200
+SPOTIFY_TRACK_LIMIT   = 500
+PLAYLIST_TRACK_LIMIT  = 500
 BOT_NAME              = "Surge"
 HISTORY_LIMIT         = 20
 QUEUE_DEFAULT_SHOW    = 15
@@ -532,42 +532,72 @@ async def fetch_spotify_tracks(url: str) -> tuple[Optional[list], Optional[str]]
                     if d.get("artists") and d.get("name"):
                         tracks.append({"title": d["name"], "artist": d["artists"][0]["name"]})
             elif sp_type == "album":
-                async with s.get(
-                    f"https://api.spotify.com/v1/albums/{sp_id}/tracks?limit=50",
-                    headers=headers,
-                ) as r:
-                    if r.status == 404:
-                        return None, "album_not_found"
-                    if r.status == 401:
-                        return None, "spotify_token_invalid"
-                    if r.status != 200:
-                        return None, f"spotify_http_{r.status}"
-                    d = await r.json()
-                    for item in d.get("items", [])[:SPOTIFY_TRACK_LIMIT]:
-                        if item and item.get("name") and item.get("artists"):
-                            tracks.append({
-                                "title": item["name"],
-                                "artist": item["artists"][0]["name"],
-                            })
+                # Пагинация для альбома (макс 50 за запрос)
+                offset = 0
+                page_size = 50
+                while len(tracks) < SPOTIFY_TRACK_LIMIT:
+                    async with s.get(
+                        f"https://api.spotify.com/v1/albums/{sp_id}/tracks"
+                        f"?limit={page_size}&offset={offset}",
+                        headers=headers,
+                    ) as r:
+                        if r.status == 404:
+                            return None, "album_not_found"
+                        if r.status == 401:
+                            return None, "spotify_token_invalid"
+                        if r.status != 200:
+                            return None, f"spotify_http_{r.status}"
+                        d = await r.json()
+                        items = d.get("items", [])
+                        if not items:
+                            break
+                        for item in items:
+                            if item and item.get("name") and item.get("artists"):
+                                tracks.append({
+                                    "title": item["name"],
+                                    "artist": item["artists"][0]["name"],
+                                })
+                                if len(tracks) >= SPOTIFY_TRACK_LIMIT:
+                                    break
+                        if len(items) < page_size:
+                            break
+                        offset += page_size
+                log.info("Spotify API album: загружено %d треков", len(tracks))
             elif sp_type == "playlist":
-                async with s.get(
-                    f"https://api.spotify.com/v1/playlists/{sp_id}/tracks?limit=50",
-                    headers=headers,
-                ) as r:
-                    if r.status == 404:
-                        return None, "playlist_not_found"
-                    if r.status == 401:
-                        return None, "spotify_token_invalid"
-                    if r.status != 200:
-                        return None, f"spotify_http_{r.status}"
-                    d = await r.json()
-                    for item in d.get("items", [])[:SPOTIFY_TRACK_LIMIT]:
-                        t = item.get("track") if item else None
-                        if t and t.get("name") and t.get("artists"):
-                            tracks.append({
-                                "title": t["name"],
-                                "artist": t["artists"][0]["name"],
-                            })
+                # Пагинация: Spotify API отдаёт максимум 100 треков за запрос.
+                # Берём страницами по 100 пока не наберём SPOTIFY_TRACK_LIMIT.
+                offset = 0
+                page_size = 100
+                while len(tracks) < SPOTIFY_TRACK_LIMIT:
+                    async with s.get(
+                        f"https://api.spotify.com/v1/playlists/{sp_id}/tracks"
+                        f"?limit={page_size}&offset={offset}",
+                        headers=headers,
+                    ) as r:
+                        if r.status == 404:
+                            return None, "playlist_not_found"
+                        if r.status == 401:
+                            return None, "spotify_token_invalid"
+                        if r.status != 200:
+                            return None, f"spotify_http_{r.status}"
+                        d = await r.json()
+                        items = d.get("items", [])
+                        if not items:
+                            break
+                        for item in items:
+                            t = item.get("track") if item else None
+                            if t and t.get("name") and t.get("artists"):
+                                tracks.append({
+                                    "title": t["name"],
+                                    "artist": t["artists"][0]["name"],
+                                })
+                                if len(tracks) >= SPOTIFY_TRACK_LIMIT:
+                                    break
+                        # Если страница неполная — больше нечего грузить
+                        if len(items) < page_size:
+                            break
+                        offset += page_size
+                log.info("Spotify API playlist: загружено %d треков", len(tracks))
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("Spotify fetch error: %s", e)
         return None, "spotify_network_error"

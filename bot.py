@@ -476,18 +476,27 @@ async def get_spotify_token() -> Optional[str]:
 
 def parse_spotify_url(url: str) -> Optional[tuple]:
     # Формат: spotify.com/[intl-XX/]track|album|playlist/ID[?si=...]
-    # Учитываем локализованные пути: /intl-ru/, /intl-en/ и т.д.
     m = re.search(
         r'spotify\.com(?:/intl-[a-z]+)?/(track|album|playlist)/([A-Za-z0-9]+)',
         url
     )
     if m:
         return m.group(1), m.group(2)
-    # URI-формат: spotify:track:ID
     m = re.search(r'spotify:(track|album|playlist):([A-Za-z0-9]+)', url)
     if m:
         return m.group(1), m.group(2)
     return None
+
+
+def is_spotify_owned_playlist(parsed: tuple) -> bool:
+    """
+    С 27 ноября 2024 Spotify заблокировал API-доступ к своим алгоритмическим
+    и редакционным плейлистам (Discover Weekly, Daily Mix, "X: радио" и т.д.)
+    Их ID обычно начинаются с '37i9dQZF1'.
+    """
+    if not parsed or parsed[0] != "playlist":
+        return False
+    return parsed[1].startswith("37i9dQZF1")
 
 
 async def fetch_spotify_tracks(url: str) -> Optional[list]:
@@ -1866,6 +1875,7 @@ async def search_with_node_fallback(
     query: str,
     source: wavelink.TrackSource,
     max_nodes: int = 3,
+    timeout: float = 15.0,
 ):
     """
     Ищет трек, перебирая разные Lavalink-ноды если первая дала ошибку.
@@ -1873,6 +1883,9 @@ async def search_with_node_fallback(
     Wavelink сам выбирает ноду через Pool, но не переключается при ошибках
     типа "Failed to Load Tracks" (когда YouTube банит конкретную ноду).
     Эта функция перебирает доступные ноды вручную.
+
+    timeout: на каждую ноду максимум столько секунд. Если нода зависла
+    (например, внутри LavaSrc на 404 от Spotify) — обрываем и идём к следующей.
 
     Возвращает (results, last_error).
     """
@@ -1888,12 +1901,19 @@ async def search_with_node_fallback(
     last_error = None
     for i, node in enumerate(nodes):
         try:
-            results = await wavelink.Playable.search(query, source=source, node=node)
+            results = await asyncio.wait_for(
+                wavelink.Playable.search(query, source=source, node=node),
+                timeout=timeout,
+            )
             if results:
                 if i > 0:
                     log.info("Поиск удался на ноде #%d (%s)", i + 1, node.uri)
                 return results, None
             last_error = None
+        except asyncio.TimeoutError:
+            log.warning("Search timeout (%.1fs) на ноде %s", timeout, node.uri)
+            last_error = Exception(f"Таймаут поиска на {node.uri}")
+            continue
         except Exception as e:
             log.warning("Search error на ноде %s: %s", node.uri, e)
             last_error = e
@@ -1992,6 +2012,29 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         return
 
     msg = await interaction.followup.send(f"🔍 Ищу **{query[:100]}**...", wait=True)
+
+    # Превентивная проверка: Spotify-owned/algorithmic плейлисты Spotify
+    # с ноября 2024 заблокировал в API. Их ID начинается с 37i9dQZF1.
+    # Если попытаться искать через Lavalink+LavaSrc — он залипает на 404
+    # внутри плагина, бот висит. Поэтому отлавливаем такие ссылки сразу.
+    if "spotify.com" in query.lower() or query.lower().startswith("spotify:"):
+        sp_parsed = parse_spotify_url(query)
+        if sp_parsed and is_spotify_owned_playlist(sp_parsed):
+            await msg.edit(
+                content="❌ **Этот плейлист недоступен через API.**\n\n"
+                        "Spotify заблокировал доступ к своим автоматически "
+                        "сгенерированным плейлистам:\n"
+                        "• Discover Weekly, Daily Mix, Release Radar\n"
+                        "• «<имя>: радио» (авто-радио по исполнителю)\n"
+                        "• Жанровые подборки от Spotify\n\n"
+                        "💡 **Что делать:**\n"
+                        "• **Сохрани плейлист себе** — в Spotify нажми ❤️ или "
+                        "«Сохранить в библиотеку», потом скинь ссылку из своих "
+                        "плейлистов\n"
+                        "• Или скидывай конкретные треки по одному\n"
+                        "• Или поищи похожий плейлист на YouTube Music"
+            )
+            return
 
     source = detect_source_from_url(query)
     search_error = None

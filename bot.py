@@ -475,9 +475,15 @@ async def get_spotify_token() -> Optional[str]:
 
 
 def parse_spotify_url(url: str) -> Optional[tuple]:
-    m = re.search(r'spotify\.com/(track|album|playlist)/([A-Za-z0-9]+)', url)
+    # Формат: spotify.com/[intl-XX/]track|album|playlist/ID[?si=...]
+    # Учитываем локализованные пути: /intl-ru/, /intl-en/ и т.д.
+    m = re.search(
+        r'spotify\.com(?:/intl-[a-z]+)?/(track|album|playlist)/([A-Za-z0-9]+)',
+        url
+    )
     if m:
         return m.group(1), m.group(2)
+    # URI-формат: spotify:track:ID
     m = re.search(r'spotify:(track|album|playlist):([A-Za-z0-9]+)', url)
     if m:
         return m.group(1), m.group(2)
@@ -2075,12 +2081,54 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         return
 
     # Fallback на Spotify API
-    if not results and "spotify.com" in query.lower():
+    # Срабатывает если:
+    # - URL спотифая И (Lavalink не нашёл, или была ошибка, или вернул пустоту)
+    is_spotify_url = "spotify.com" in query.lower() or query.lower().startswith("spotify:")
+    spotify_failed = is_spotify_url and (
+        not results
+        or search_error is not None
+        or (isinstance(results, list) and len(results) == 0)
+    )
+
+    if spotify_failed:
+        log.info("Spotify fallback: пробую обработать %r", query)
+
+        # Проверка что Spotify настроен
+        if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+            log.warning("Spotify fallback: нет SPOTIFY_CLIENT_ID/SECRET в env")
+            await msg.edit(
+                content="❗ **Spotify не настроен на сервере бота.**\n"
+                        "_Администратор должен добавить SPOTIFY_CLIENT_ID "
+                        "и SPOTIFY_CLIENT_SECRET в переменные окружения._"
+            )
+            return
+
+        # Проверка парсинга URL
+        parsed = parse_spotify_url(query)
+        if not parsed:
+            log.warning("Spotify fallback: не смог распарсить URL %r", query)
+            await msg.edit(
+                content="❗ **Неверный формат ссылки Spotify.**\n"
+                        "_Поддерживаются: track, album, playlist._\n"
+                        "Пример: `https://open.spotify.com/playlist/...`"
+            )
+            return
+        log.info("Spotify fallback: распознал тип=%s id=%s", parsed[0], parsed[1])
+
         await msg.edit(content="🎵 Получаю треки из Spotify через API...")
         spotify_tracks = await fetch_spotify_tracks(query)
         if not spotify_tracks:
-            await msg.edit(content="❗ Не удалось получить треки Spotify. Проверь ссылку.")
+            log.warning("Spotify fallback: API вернул пустой список или ошибку")
+            await msg.edit(
+                content="❗ **Не удалось получить треки Spotify.**\n"
+                        "_Возможные причины:_\n"
+                        "• Плейлист приватный\n"
+                        "• Spotify токен истёк (попробуй ещё раз)\n"
+                        "• Spotify API временно недоступен\n"
+                        "_Подробности в логах бота._"
+            )
             return
+        log.info("Spotify fallback: получил %d треков", len(spotify_tracks))
 
         limited_sp = spotify_tracks[:PLAYLIST_TRACK_LIMIT]
         if not await check_track_limit(interaction, len(limited_sp)):

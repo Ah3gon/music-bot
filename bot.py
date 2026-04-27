@@ -499,14 +499,19 @@ def is_spotify_owned_playlist(parsed: tuple) -> bool:
     return parsed[1].startswith("37i9dQZF1")
 
 
-async def fetch_spotify_tracks(url: str) -> Optional[list]:
+async def fetch_spotify_tracks(url: str) -> tuple[Optional[list], Optional[str]]:
+    """
+    Возвращает (tracks, error_reason).
+    Если успех — (список треков, None).
+    Если ошибка — (None, описание причины).
+    """
     parsed = parse_spotify_url(url)
     if not parsed:
-        return None
+        return None, "Не удалось распознать ссылку Spotify"
     sp_type, sp_id = parsed
     token = await get_spotify_token()
     if not token:
-        return None
+        return None, "Spotify не настроен или токен недоступен"
     headers = {"Authorization": f"Bearer {token}"}
     tracks = []
     try:
@@ -517,8 +522,12 @@ async def fetch_spotify_tracks(url: str) -> Optional[list]:
                 async with s.get(
                     f"https://api.spotify.com/v1/tracks/{sp_id}", headers=headers
                 ) as r:
+                    if r.status == 404:
+                        return None, "track_not_found"
+                    if r.status == 401:
+                        return None, "spotify_token_invalid"
                     if r.status != 200:
-                        return None
+                        return None, f"spotify_http_{r.status}"
                     d = await r.json()
                     if d.get("artists") and d.get("name"):
                         tracks.append({"title": d["name"], "artist": d["artists"][0]["name"]})
@@ -527,8 +536,12 @@ async def fetch_spotify_tracks(url: str) -> Optional[list]:
                     f"https://api.spotify.com/v1/albums/{sp_id}/tracks?limit=50",
                     headers=headers,
                 ) as r:
+                    if r.status == 404:
+                        return None, "album_not_found"
+                    if r.status == 401:
+                        return None, "spotify_token_invalid"
                     if r.status != 200:
-                        return None
+                        return None, f"spotify_http_{r.status}"
                     d = await r.json()
                     for item in d.get("items", [])[:SPOTIFY_TRACK_LIMIT]:
                         if item and item.get("name") and item.get("artists"):
@@ -541,8 +554,12 @@ async def fetch_spotify_tracks(url: str) -> Optional[list]:
                     f"https://api.spotify.com/v1/playlists/{sp_id}/tracks?limit=50",
                     headers=headers,
                 ) as r:
+                    if r.status == 404:
+                        return None, "playlist_not_found"
+                    if r.status == 401:
+                        return None, "spotify_token_invalid"
                     if r.status != 200:
-                        return None
+                        return None, f"spotify_http_{r.status}"
                     d = await r.json()
                     for item in d.get("items", [])[:SPOTIFY_TRACK_LIMIT]:
                         t = item.get("track") if item else None
@@ -553,8 +570,11 @@ async def fetch_spotify_tracks(url: str) -> Optional[list]:
                             })
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("Spotify fetch error: %s", e)
-        return None
-    return tracks or None
+        return None, "spotify_network_error"
+
+    if not tracks:
+        return None, "spotify_empty"
+    return tracks, None
 
 
 # ─────────────────────────────────────────────
@@ -2159,17 +2179,52 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         log.info("Spotify fallback: распознал тип=%s id=%s", parsed[0], parsed[1])
 
         await msg.edit(content="🎵 Получаю треки из Spotify через API...")
-        spotify_tracks = await fetch_spotify_tracks(query)
+        spotify_tracks, sp_error = await fetch_spotify_tracks(query)
         if not spotify_tracks:
-            log.warning("Spotify fallback: API вернул пустой список или ошибку")
-            await msg.edit(
-                content="❗ **Не удалось получить треки Spotify.**\n"
-                        "_Возможные причины:_\n"
-                        "• Плейлист приватный\n"
-                        "• Spotify токен истёк (попробуй ещё раз)\n"
-                        "• Spotify API временно недоступен\n"
-                        "_Подробности в логах бота._"
-            )
+            log.warning("Spotify fallback: ошибка %s", sp_error)
+
+            # Подробное сообщение в зависимости от типа ошибки
+            sp_type = parsed[0]
+            type_name = {"track": "трек", "album": "альбом", "playlist": "плейлист"}.get(sp_type, "ресурс")
+
+            if sp_error in ("playlist_not_found", "track_not_found", "album_not_found"):
+                # Это самая частая причина — приватный плейлист
+                err_msg = (
+                    f"❌ **{type_name.capitalize()} недоступен через API.**\n\n"
+                    "Возможные причины:\n"
+                    f"• {type_name.capitalize()} **приватный** — Spotify API "
+                    f"не отдаёт чужие приватные плейлисты\n"
+                    f"• {type_name.capitalize()} удалён или его не существует\n"
+                    "• Ссылка повреждена\n\n"
+                    "💡 **Как проверить:**\n"
+                    "1. Открой ссылку в режиме инкогнито (без логина)\n"
+                    "2. Если видишь страницу — публичный, что-то ещё не так\n"
+                    "3. Если просит залогиниться — приватный\n\n"
+                    "Чтобы сделать плейлист публичным: открой его в Spotify → "
+                    "три точки → «Сделать публичным»"
+                )
+            elif sp_error == "spotify_token_invalid":
+                err_msg = (
+                    "❌ **Spotify токен недействителен.**\n"
+                    "_Администратору: проверь SPOTIFY_CLIENT_ID и "
+                    "SPOTIFY_CLIENT_SECRET в Railway._"
+                )
+            elif sp_error == "spotify_network_error":
+                err_msg = (
+                    "❌ **Spotify API временно недоступен.**\n"
+                    "_Попробуй ещё раз через минуту._"
+                )
+            elif sp_error == "spotify_empty":
+                err_msg = (
+                    f"❌ **{type_name.capitalize()} пустой.**\n"
+                    "В нём нет треков, либо все треки недоступны в твоём регионе."
+                )
+            else:
+                err_msg = (
+                    f"❌ **Не удалось получить {type_name}.**\n"
+                    f"_Ошибка: {sp_error}_"
+                )
+            await msg.edit(content=err_msg)
             return
         log.info("Spotify fallback: получил %d треков", len(spotify_tracks))
 

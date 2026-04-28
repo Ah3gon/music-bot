@@ -1707,7 +1707,19 @@ class TrackSelectView(discord.ui.View):
             player: wavelink.Player = self.guild.voice_client
             try:
                 if player is None:
-                    player = await self.voice_channel.connect(cls=wavelink.Player)
+                    player = await connect_to_voice(self.voice_channel)
+                    if player is None:
+                        try:
+                            await self.search_msg.edit(
+                                content="❗ Не удалось подключиться к голосовому каналу.\n"
+                                        "_Lavalink-ноды могут быть недоступны или Discord "
+                                        "не отвечает. Попробуй ещё раз через минуту._",
+                                view=None,
+                            )
+                        except discord.HTTPException:
+                            pass
+                        self.stop()
+                        return
                 elif player.channel != self.voice_channel:
                     await player.move_to(self.voice_channel)
             except Exception as e:
@@ -1981,7 +1993,10 @@ async def _play_birthday_now(member: discord.Member,
 
     if player is None or not player.connected:
         try:
-            player = await channel.connect(cls=wavelink.Player)
+            player = await connect_to_voice(channel)
+            if player is None:
+                log.warning("Birthday: не удалось подключиться к голосовому каналу")
+                return
             player.autoplay = wavelink.AutoPlayMode.disabled
             if text_channel:
                 state["text_channel_id"] = text_channel.id
@@ -2179,6 +2194,45 @@ async def safe_play_track(
     return False
 
 
+def get_healthy_node() -> Optional[wavelink.Node]:
+    """Возвращает первую CONNECTED-ноду или None если все упали."""
+    for node in wavelink.Pool.nodes.values():
+        if node.status == wavelink.NodeStatus.CONNECTED:
+            return node
+    return None
+
+
+async def connect_to_voice(
+    voice_channel: discord.VoiceChannel,
+    timeout: float = 20.0,
+) -> Optional[wavelink.Player]:
+    """
+    Подключается к голосовому каналу с явным указанием рабочей ноды.
+    Если Wavelink сам выбирает ноду — он может зацепиться за упавшую,
+    и подключение зависнет на 30 сек таймаута.
+
+    Возвращает Player или None если не удалось.
+    """
+    node = get_healthy_node()
+    if node is None:
+        log.warning("connect_to_voice: нет ни одной живой Lavalink-ноды")
+        return None
+    try:
+        player = await asyncio.wait_for(
+            voice_channel.connect(cls=wavelink.Player, self_deaf=True),
+            timeout=timeout,
+        )
+        return player
+    except asyncio.TimeoutError:
+        log.warning("connect_to_voice: таймаут (%.1fs) при подключении к %s",
+                    timeout, voice_channel.name)
+        return None
+    except Exception as e:
+        log.warning("connect_to_voice: ошибка %s при подключении к %s",
+                    e, voice_channel.name)
+        return None
+
+
 async def search_with_node_fallback(
     query: str,
     source: wavelink.TrackSource,
@@ -2295,7 +2349,9 @@ async def ensure_voice_connection(
     player: wavelink.Player = interaction.guild.voice_client
     try:
         if player is None:
-            player = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+            player = await connect_to_voice(interaction.user.voice.channel)
+            if player is None:
+                return None
         elif player.channel != interaction.user.voice.channel:
             await player.move_to(interaction.user.voice.channel)
     except Exception as e:

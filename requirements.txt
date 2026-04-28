@@ -1,5 +1,5 @@
-discord.py[voice]>=2.4.0
-wavelink>=3.5.1
+discord.py[voice]==2.4.0
+wavelink==3.5.1
 asyncpg
 aiohttp
 python-dotenv

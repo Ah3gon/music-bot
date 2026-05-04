@@ -65,9 +65,9 @@ NODES = [
     {"uri": "http://lavalink.triniumhost.com:2333", "password": "kirito"},
     {"uri": "http://lavalink.triniumhost.com:4333", "password": "free"},
     {"uri": "https://lavalink-v4.triniumhost.com:443", "password": "free"},
-    {"uri": "https://lava-v4.ajieblogs.eu.org", "password": "https://dsc.gg/ajidevserver","secure": True},
-    {"uri": "https://lavalink.clxud.dev", "password": "youshallnotpass", "port": 443, "secure": True},
-    {"uri": "lavalinkv4.serenetia.com", "password": "https://seretia.link/discord", "port": 443, "secure": True}
+    {"uri": "https://lava-v4.ajieblogs.eu.org", "password": "https://dsc.gg/ajidevserver"},
+    {"uri": "https://lavalink.clxud.dev", "password": "youshallnotpass"},
+    {"uri": "lavalinkv4.serenetia.com", "password": "https://seretia.link/discord"}
 ]
 
 MAX_INT32 = 2147483647

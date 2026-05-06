@@ -60,14 +60,7 @@ NODES = [
     # при падении одной — переключается на следующую.
     # Актуальные ноды: https://lavalink-list.darrennathanael.com
     # Если нода не работает — закомментируй её через #
-    {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
-    {"uri": "http://n3.nexcloud.in:2026",       "password": "nexcloud"},
-    {"uri": "http://lavalink.triniumhost.com:2333", "password": "kirito"},
-    {"uri": "http://lavalink.triniumhost.com:4333", "password": "free"},
-    {"uri": "https://lavalink-v4.triniumhost.com:443", "password": "free"},
-    {"uri": "https://lava-v4.ajieblogs.eu.org", "password": "https://dsc.gg/ajidevserver"},
-    {"uri": "https://lavalink.clxud.dev", "password": "youshallnotpass"},
-    {"uri": "lavalinkv4.serenetia.com", "password": "https://seretia.link/discord"}
+    {"uri": "http://138.124.127.145:2333", "password": "surgepass"}
 ]
 
 MAX_INT32 = 2147483647

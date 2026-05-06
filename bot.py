@@ -3579,10 +3579,13 @@ async def on_ready():
     else:
         log.warning("DATABASE_URL не задан — БД отключена")
 
-    nodes = [wavelink.Node(**n) for n in NODES]
     try:
-        await wavelink.Pool.connect(nodes=nodes, client=bot)
-        log.info("Подключение к %d Lavalink-нодам инициировано", len(nodes))
+        node = wavelink.Node(
+            uri="http://138.124.127.145:2333",
+            password="surgepass"
+        )
+        await wavelink.Pool.connect(nodes=[node], client=bot)
+        log.info("Lavalink VPS node connected successfully")
     except Exception as e:
         log.error("Lavalink connect error: %s", e)
 

@@ -60,7 +60,15 @@ NODES = [
     # при падении одной — переключается на следующую.
     # Актуальные ноды: https://lavalink-list.darrennathanael.com
     # Если нода не работает — закомментируй её через #
-    {"uri": "http://138.124.127.145:2333", "password": "79adf67e45156349215a628f1e89d2bd1e4ea2cb42d84f9e"}
+    {"uri": "http://127.0.0.1:2333", "password": "79adf67e45156349215a628f1e89d2bd1e4ea2cb42d84f9e"},
+    {"uri": "http://lavalink.jirayu.net:13592", "password": "youshallnotpass"},
+    {"uri": "http://n3.nexcloud.in:2026",       "password": "nexcloud"},
+    {"uri": "http://lavalink.triniumhost.com:2333", "password": "kirito"},
+    {"uri": "http://lavalink.triniumhost.com:4333", "password": "free"},
+    {"uri": "https://lavalink-v4.triniumhost.com:443", "password": "free"},
+    {"uri": "https://lava-v4.ajieblogs.eu.org", "password": "https://dsc.gg/ajidevserver"},
+    {"uri": "https://lavalink.clxud.dev", "password": "youshallnotpass"},
+    {"uri": "lavalinkv4.serenetia.com", "password": "https://seretia.link/discord"}
 ]
 
 MAX_INT32 = 2147483647
@@ -3579,13 +3587,10 @@ async def on_ready():
     else:
         log.warning("DATABASE_URL не задан — БД отключена")
 
+    nodes = [wavelink.Node(**n) for n in NODES]
     try:
-        node = wavelink.Node(
-            uri="http://138.124.127.145:2333",
-            password="surgepass"
-        )
-        await wavelink.Pool.connect(nodes=[node], client=bot)
-        log.info("Lavalink VPS node connected successfully")
+        await wavelink.Pool.connect(nodes=nodes, client=bot)
+        log.info("Подключение к %d Lavalink-нодам инициировано", len(nodes))
     except Exception as e:
         log.error("Lavalink connect error: %s", e)
 

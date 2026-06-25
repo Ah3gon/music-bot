@@ -1,4 +1,24 @@
+# Секреты — НИКОГДА не коммитим
 .env
-.venv
-__pycache__
-ffmpeg.exe
+*.env
+.env.*
+ENV
+
+# Бинарники плагинов
+*.jar
+
+# Бэкапы
+*.bak
+*.bak-*
+bot.py.bak*
+*.SAFE-*
+*.PREPUSH-*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Логи
+*.log

@@ -32,6 +32,7 @@ DISCORD_TOKEN         = os.getenv("DISCORD_TOKEN")
 DATABASE_URL          = os.getenv("DATABASE_URL")
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "")
 GENIUS_TOKEN          = os.getenv("GENIUS_TOKEN", "")
 IDLE_TIMEOUT          = 300
 EMPTY_CH_TIMEOUT      = 60
@@ -56,11 +57,8 @@ EFFECTS = {
 }
 
 NODES = [
-    # Список публичных Lavalink-нод. Wavelink автоматически выбирает рабочую,
-    # при падении одной — переключается на следующую.
-    # Актуальные ноды: https://lavalink-list.darrennathanael.com
-    # Если нода не работает — закомментируй её через #
-    {"uri": "http://138.124.127.145:2333", "password": "79adf67e45156349215a628f1e89d2bd1e4ea2cb42d84f9e"}
+    {"uri": os.getenv("LAVALINK_URI", "http://127.0.0.1:2333"),
+     "password": os.getenv("LAVALINK_PASSWORD", "")},
 ]
 
 MAX_INT32 = 2147483647
@@ -443,6 +441,34 @@ async def get_fair_queue_enabled(guild_id: int) -> bool:
 async def get_spotify_token() -> Optional[str]:
     global _spotify_token, _spotify_token_expires
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    if _spotify_token and time.time() < _spotify_token_expires:
+        return _spotify_token
+    creds = base64.b64encode(
+        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
+    ).decode()
+    if SPOTIFY_REFRESH_TOKEN:
+        body = {"grant_type": "refresh_token", "refresh_token": SPOTIFY_REFRESH_TOKEN}
+    else:
+        body = {"grant_type": "client_credentials"}
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as s:
+            async with s.post(
+                "https://accounts.spotify.com/api/token",
+                headers={"Authorization": f"Basic {creds}"},
+                data=body,
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("Spotify auth failed: %s", resp.status)
+                    return None
+                data = await resp.json()
+                _spotify_token = data["access_token"]
+                _spotify_token_expires = time.time() + data["expires_in"] - 60
+                return _spotify_token
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("Spotify auth error: %s", e)
         return None
     if _spotify_token and time.time() < _spotify_token_expires:
         return _spotify_token
@@ -1412,22 +1438,22 @@ class QueuePaginationView(discord.ui.View):
     @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
     async def first_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 0
-        await interaction.response.edit_message(content=self.build_text(), view=self)
+        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
 
     @discord.ui.button(emoji="◀", style=discord.ButtonStyle.primary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = max(0, self.current_page - 1)
-        await interaction.response.edit_message(content=self.build_text(), view=self)
+        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
 
     @discord.ui.button(emoji="▶", style=discord.ButtonStyle.primary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = min(self.total_pages() - 1, self.current_page + 1)
-        await interaction.response.edit_message(content=self.build_text(), view=self)
+        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
 
     @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
     async def last_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = self.total_pages() - 1
-        await interaction.response.edit_message(content=self.build_text(), view=self)
+        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
 
     @discord.ui.button(label="🔢 К странице", style=discord.ButtonStyle.success)
     async def jump_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1583,7 +1609,7 @@ class PlayerControls(discord.ui.View):
             return
         view = QueuePaginationView(self.guild, interaction.user.id)
         text = view.build_text()
-        await interaction.response.send_message(text, view=view, ephemeral=True)
+        await interaction.response.send_message(text, view=view, ephemeral=True, suppress_embeds=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:
@@ -2951,7 +2977,7 @@ async def queue_cmd(interaction: discord.Interaction):
         return
     view = QueuePaginationView(interaction.guild, interaction.user.id)
     text = view.build_text()
-    await interaction.response.send_message(text, view=view, ephemeral=True)
+    await interaction.response.send_message(text, view=view, ephemeral=True, suppress_embeds=True)
     try:
         view.message = await interaction.original_response()
     except discord.HTTPException:
@@ -3579,13 +3605,10 @@ async def on_ready():
     else:
         log.warning("DATABASE_URL не задан — БД отключена")
 
+    nodes = [wavelink.Node(**n) for n in NODES]
     try:
-        node = wavelink.Node(
-            uri="http://138.124.127.145:2333",
-            password="surgepass"
-        )
-        await wavelink.Pool.connect(nodes=[node], client=bot)
-        log.info("Lavalink VPS node connected successfully")
+        await wavelink.Pool.connect(nodes=nodes, client=bot)
+        log.info("Подключение к %d Lavalink-нодам инициировано", len(nodes))
     except Exception as e:
         log.error("Lavalink connect error: %s", e)
 

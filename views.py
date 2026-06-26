@@ -15,9 +15,9 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_get_playlist, db_get_settings
+from database import db_add_track, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
-from playback import connect_to_voice
+from playback import connect_to_voice, search_with_node_fallback
 
 # ─────────────────────────────────────────────
 #  Голосование за скип
@@ -586,3 +586,177 @@ class TrackSelectView(discord.ui.View):
         except discord.HTTPException:
             pass
 
+
+class PlaylistEditView(discord.ui.View):
+    PER_PAGE = 25
+
+    def __init__(self, owner_id, playlist_id, playlist_name, tracks, message=None):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.playlist_id = playlist_id
+        self.playlist_name = playlist_name
+        self.tracks = tracks
+        self.page = 0
+        self.selected_id = None
+        self.message = message
+        self._build()
+
+    @property
+    def pages(self):
+        return max(1, (len(self.tracks) + self.PER_PAGE - 1) // self.PER_PAGE)
+
+    def _build(self):
+        self.clear_items()
+        if not self.tracks:
+            return
+        start = self.page * self.PER_PAGE
+        page_tracks = self.tracks[start:start + self.PER_PAGE]
+        options = []
+        for t in page_tracks:
+            options.append(discord.SelectOption(
+                label=(t["title"] or "—")[:100],
+                value=str(t["id"]),
+                description=f"#{t['position']} · {format_duration(t['duration'])}"[:100],
+                default=(t["id"] == self.selected_id),
+            ))
+        sel = discord.ui.Select(placeholder="Выбери трек…", options=options, row=0)
+        sel.callback = self._on_select
+        self.add_item(sel)
+        if self.pages > 1:
+            prev = discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary,
+                                     disabled=(self.page == 0), row=1)
+            prev.callback = self._prev
+            self.add_item(prev)
+            nxt = discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary,
+                                    disabled=(self.page >= self.pages - 1), row=1)
+            nxt.callback = self._next
+            self.add_item(nxt)
+        dele = discord.ui.Button(label="🗑 Удалить", style=discord.ButtonStyle.danger,
+                                 disabled=(self.selected_id is None), row=1)
+        dele.callback = self._delete
+        self.add_item(dele)
+        ver = discord.ui.Button(label="🔄 Сменить версию", style=discord.ButtonStyle.primary,
+                                disabled=(self.selected_id is None), row=1)
+        ver.callback = self._change_version
+        self.add_item(ver)
+
+    def _text(self):
+        head = f"✏️ **Редактор «{self.playlist_name}»** — {len(self.tracks)} треков"
+        if self.pages > 1:
+            head += f"  ·  стр. {self.page + 1}/{self.pages}"
+        if self.selected_id:
+            t = next((x for x in self.tracks if x["id"] == self.selected_id), None)
+            if t:
+                head += f"\n\nВыбран: **{t['title']}**"
+        return head
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❗ Это не твой редактор.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction):
+        self.selected_id = int(interaction.data["values"][0])
+        self._build()
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _prev(self, interaction):
+        self.page = max(0, self.page - 1)
+        self.selected_id = None
+        self._build()
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _next(self, interaction):
+        self.page = min(self.pages - 1, self.page + 1)
+        self.selected_id = None
+        self._build()
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _delete(self, interaction):
+        if self.selected_id is None:
+            return
+        await db_delete_track(self.selected_id, self.playlist_id)
+        self.tracks = await db_get_tracks(self.playlist_id)
+        self.selected_id = None
+        if self.page >= self.pages:
+            self.page = self.pages - 1
+        self._build()
+        if not self.tracks:
+            await interaction.response.edit_message(content="📭 Плейлист теперь пуст.", view=None)
+            self.stop()
+            return
+        await interaction.response.edit_message(content=self._text(), view=self)
+
+    async def _change_version(self, interaction):
+        if self.selected_id is None:
+            return
+        t = next((x for x in self.tracks if x["id"] == self.selected_id), None)
+        if not t:
+            return
+        await interaction.response.defer()
+        results, _ = await search_with_node_fallback(t["title"], wavelink.TrackSource.YouTube)
+        if results:
+            if isinstance(results, wavelink.Playlist):
+                cand = results.tracks[:5]
+            elif isinstance(results, list):
+                cand = results[:5]
+            else:
+                cand = [results]
+        else:
+            cand = []
+        if not cand:
+            await interaction.followup.send("😕 Не нашёл вариантов для замены.", ephemeral=True)
+            return
+        vview = VersionSelectView(self, t, cand)
+        await interaction.edit_original_response(
+            content=f"🔄 Выбери версию для **{t['title']}**:", view=vview)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(content="⏱ Редактор закрыт.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+class VersionSelectView(discord.ui.View):
+    def __init__(self, editor, track_row, candidates):
+        super().__init__(timeout=120)
+        self.editor = editor
+        self.track_row = track_row
+        self.candidates = candidates
+        options = []
+        for i, c in enumerate(candidates):
+            options.append(discord.SelectOption(
+                label=c.title[:100],
+                value=str(i),
+                description=format_duration(c.length)[:100],
+            ))
+        sel = discord.ui.Select(placeholder="Выбери нужную версию…", options=options, row=0)
+        sel.callback = self._on_pick
+        self.add_item(sel)
+        cancel = discord.ui.Button(label="Отмена", style=discord.ButtonStyle.secondary, row=1)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.editor.owner_id:
+            await interaction.response.send_message("❗ Это не твой редактор.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_pick(self, interaction):
+        c = self.candidates[int(interaction.data["values"][0])]
+        await db_update_track(self.track_row["id"], self.editor.playlist_id,
+                              c.title, c.uri or "", c.length)
+        self.editor.tracks = await db_get_tracks(self.editor.playlist_id)
+        self.editor.selected_id = None
+        self.editor._build()
+        await interaction.response.edit_message(
+            content=self.editor._text() + f"\n\n✅ Версия обновлена: **{c.title}**",
+            view=self.editor)
+
+    async def _cancel(self, interaction):
+        self.editor._build()
+        await interaction.response.edit_message(content=self.editor._text(), view=self.editor)

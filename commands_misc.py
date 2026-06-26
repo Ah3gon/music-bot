@@ -17,7 +17,8 @@ from core import *
 
 from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
-from playback import ensure_voice_connection, safe_play_track, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_with_node_fallback
+from spotify import fetch_spotify_with_fallback, parse_spotify_url
 
 # ─────────────────────────────────────────────
 #  Настройки сервера
@@ -347,6 +348,87 @@ async def pl_tracks(interaction: discord.Interaction, name: str):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+@playlist_group.command(name="import", description="Импортировать плейлист по ссылке в свой плейлист")
+@app_commands.describe(url="Ссылка (YouTube / Spotify / Яндекс / SoundCloud)", name="Название плейлиста в боте")
+async def pl_import(interaction: discord.Interaction, url: str, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message(
+            f"❗ Название должно быть не пустым и не длиннее {PLAYLIST_NAME_MAX} символов.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    # получить или создать плейлист
+    playlist = await db_get_playlist(interaction.user.id, clean)
+    if playlist:
+        playlist_id = playlist["id"]
+    else:
+        playlist_id = await db_create_playlist(interaction.user.id, clean)
+        if playlist_id is None:
+            await interaction.followup.send("❗ Не удалось создать плейлист.", ephemeral=True)
+            return
+
+    url = url.strip()
+    is_spotify_url = "spotify.com" in url.lower() or url.lower().startswith("spotify:")
+    added = 0
+
+    # ---- Spotify: получаем треки и ищем их на YouTube ----
+    if is_spotify_url:
+        if not parse_spotify_url(url):
+            await interaction.followup.send("❗ Не похоже на ссылку Spotify.", ephemeral=True)
+            return
+        msg = await interaction.followup.send("🎵 Получаю треки из Spotify...", ephemeral=True, wait=True)
+        spotify_tracks, sp_error = await fetch_spotify_with_fallback(url)
+        if not spotify_tracks:
+            await msg.edit(content=f"❌ Не удалось получить треки из Spotify (_{sp_error}_).")
+            return
+        limited = spotify_tracks[:PLAYLIST_TRACK_LIMIT]
+        await msg.edit(content=f"🔍 Импортирую {len(limited)} треков (ищу на YouTube)...")
+        for i, sp in enumerate(limited, 1):
+            results, _ = await search_with_node_fallback(
+                f"{sp['artist']} - {sp['title']}", wavelink.TrackSource.YouTube
+            )
+            if results:
+                track = results[0] if isinstance(results, list) else results.tracks[0]
+                await db_add_track(playlist_id, track.title, track.uri or "", track.length)
+                added += 1
+            if i % 25 == 0:
+                try:
+                    await msg.edit(content=f"🔍 Импортирую... {i}/{len(limited)}")
+                except discord.HTTPException:
+                    pass
+        note = "" if added == len(spotify_tracks) else f"\n_Spotify отдал {len(spotify_tracks)} треков (лимит/ограничение API)._"
+        await msg.edit(content=f"✅ Импортировано в **{clean}**: `{added}` треков из Spotify.{note}")
+        return
+
+    # ---- YouTube / Яндекс / SoundCloud: грузим через Lavalink напрямую ----
+    source = detect_source_from_url(url)
+    msg = await interaction.followup.send("⏳ Загружаю плейлист...", ephemeral=True, wait=True)
+    results, err = await search_with_node_fallback(url, source)
+    if not results:
+        await msg.edit(content="😕 Ничего не найдено по ссылке. Возможно, это не плейлист, либо нода временно недоступна.")
+        return
+    if isinstance(results, wavelink.Playlist):
+        tracks = results.tracks[:PLAYLIST_TRACK_LIMIT]
+        total = len(results.tracks)
+    elif isinstance(results, list):
+        tracks = results[:PLAYLIST_TRACK_LIMIT]
+        total = len(results)
+    else:
+        tracks = [results]
+        total = 1
+    for t in tracks:
+        await db_add_track(playlist_id, t.title, t.uri or "", t.length)
+        added += 1
+    note = f"\n_Загружено {added} из {total} (лимит {PLAYLIST_TRACK_LIMIT})._" if total > PLAYLIST_TRACK_LIMIT else ""
+    await msg.edit(content=f"✅ Импортировано в **{clean}**: `{added}` треков.{note}")
+
+
 tree.add_command(playlist_group)
 
 
@@ -488,4 +570,3 @@ async def on_app_command_error(interaction: discord.Interaction,
             await interaction.response.send_message(err_msg, ephemeral=True)
     except discord.HTTPException:
         pass
-

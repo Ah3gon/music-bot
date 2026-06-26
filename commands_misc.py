@@ -10,6 +10,8 @@ import re
 import time
 import base64
 import logging
+import csv
+import io
 import datetime
 from typing import Optional
 import core
@@ -545,6 +547,93 @@ async def pl_import_shared(interaction: discord.Interaction, code: str, name: Op
         f"✅ Плейлист скопирован как **{target}** — `{added}` треков. Играй: `/playlist play {target}`",
         ephemeral=True,
     )
+
+
+@playlist_group.command(name="import-file", description="Импорт плейлиста из CSV-файла (экспорт Spotify и т.п.)")
+@app_commands.describe(name="Название плейлиста в боте", file="CSV-файл со столбцами названия и исполнителя")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
+async def pl_import_file(interaction: discord.Interaction, name: str, file: discord.Attachment):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    if not file.filename.lower().endswith(".csv"):
+        await interaction.response.send_message("❗ Нужен файл с расширением `.csv`.", ephemeral=True)
+        return
+    if file.size > 2_000_000:
+        await interaction.response.send_message("❗ Файл слишком большой (макс ~2 МБ).", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw = await file.read()
+        text = raw.decode("utf-8-sig", errors="replace")
+    except Exception:
+        await interaction.followup.send("❗ Не удалось прочитать файл.", ephemeral=True)
+        return
+
+    reader = csv.DictReader(io.StringIO(text))
+    fields = reader.fieldnames or []
+    if not fields:
+        await interaction.followup.send("❗ Пустой или нечитаемый CSV.", ephemeral=True)
+        return
+
+    def find_col(keys):
+        for k in keys:
+            for col in fields:
+                if k in col.lower():
+                    return col
+        return None
+
+    title_col = find_col(["track name", "track", "title", "song", "name"]) or fields[0]
+    artist_col = find_col(["artist", "performer"])
+
+    rows = list(reader)
+    if not rows:
+        await interaction.followup.send("❗ В файле нет строк с треками.", ephemeral=True)
+        return
+
+    playlist = await db_get_playlist(interaction.user.id, clean)
+    if playlist:
+        playlist_id = playlist["id"]
+    else:
+        playlist_id = await db_create_playlist(interaction.user.id, clean)
+        if playlist_id is None:
+            await interaction.followup.send("❗ Не удалось создать плейлист.", ephemeral=True)
+            return
+
+    limited = rows[:PLAYLIST_TRACK_LIMIT]
+    msg = await interaction.followup.send(
+        f"🔍 Импортирую {len(limited)} треков из файла (ищу на YouTube)...",
+        ephemeral=True, wait=True)
+    added = 0
+    for i, row in enumerate(limited, 1):
+        title = (row.get(title_col) or "").strip()
+        if not title:
+            continue
+        artist = (row.get(artist_col) or "").strip() if artist_col else ""
+        query = f"{artist} - {title}" if artist else title
+        try:
+            results, _ = await search_with_node_fallback(query, wavelink.TrackSource.YouTube)
+        except Exception:
+            results = None
+        if results:
+            track = results[0] if isinstance(results, list) else results.tracks[0]
+            await db_add_track(playlist_id, track.title, track.uri or "", track.length)
+            added += 1
+        if i % 25 == 0:
+            try:
+                await msg.edit(content=f"🔍 Импортирую... {i}/{len(limited)}")
+            except discord.HTTPException:
+                pass
+
+    note = ""
+    if len(rows) > PLAYLIST_TRACK_LIMIT:
+        note = chr(10) + f"_В файле {len(rows)} строк, взято первых {PLAYLIST_TRACK_LIMIT}._"
+    await msg.edit(content=f"✅ Импортировано в **{clean}**: `{added}` треков из файла.{note}")
 
 
 tree.add_command(playlist_group)

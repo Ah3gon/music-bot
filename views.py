@@ -146,7 +146,7 @@ class JumpToPageModal(discord.ui.Modal, title="Перейти к страниц�
             return
         self.view_ref.current_page = target - 1
         await interaction.response.edit_message(
-            content=self.view_ref.build_text(),
+            embed=self.view_ref.build_embed(),
             view=self.view_ref,
         )
 
@@ -182,39 +182,43 @@ class QueuePaginationView(discord.ui.View):
             return 1
         return max(1, (len(snapshot) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE)
 
-    def build_text(self) -> str:
+    def build_embed(self) -> discord.Embed:
         p = self.player
         snapshot = self.get_queue_snapshot()
         total_pages = self.total_pages()
         self.current_page = max(0, min(self.current_page, total_pages - 1))
 
-        lines = []
+        embed = discord.Embed(color=BRAND_COLOR)
+        embed.set_author(name="📜 Очередь")
+
         if p and p.current:
             t = p.current
-            link = f" — [открыть]({t.uri})" if t.uri else ""
-            lines.append(
-                f"🎵 **Сейчас:** {t.title} `[{format_duration(t.length)}]`{link}\n"
+            cur = f"[{t.title}]({t.uri})" if t.uri else t.title
+            embed.add_field(
+                name="🎵 Сейчас",
+                value=f"**{cur}** `[{format_duration(t.length)}]`",
+                inline=False,
             )
 
         if not snapshot:
-            lines.append("📭 Очередь пуста.")
+            embed.description = "📭 Очередь пуста."
             self._update_buttons(total_pages)
-            return "\n".join(lines)
+            return embed
 
         start = self.current_page * TRACKS_PER_PAGE
         end = start + TRACKS_PER_PAGE
         shown = snapshot[start:end]
 
-        lines.append(
-            f"**Очередь** — `{len(snapshot)} треков` · "
-            f"Страница **{self.current_page + 1}/{total_pages}**\n"
-        )
+        lines = []
         for i, t in enumerate(shown, start=start + 1):
             link = f" — [открыть]({t.uri})" if t.uri else ""
             lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`{link}")
+        embed.description = "\n".join(lines)
+        embed.set_footer(
+            text=f"{len(snapshot)} треков · страница {self.current_page + 1}/{total_pages}")
 
         self._update_buttons(total_pages)
-        return "\n".join(lines)
+        return embed
 
     def _update_buttons(self, total_pages: int):
         self.first_btn.disabled = self.current_page == 0
@@ -233,22 +237,22 @@ class QueuePaginationView(discord.ui.View):
     @discord.ui.button(emoji="⏮", style=discord.ButtonStyle.secondary)
     async def first_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 0
-        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(emoji="◀", style=discord.ButtonStyle.primary)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = max(0, self.current_page - 1)
-        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(emoji="▶", style=discord.ButtonStyle.primary)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = min(self.total_pages() - 1, self.current_page + 1)
-        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(emoji="⏭", style=discord.ButtonStyle.secondary)
     async def last_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = self.total_pages() - 1
-        await interaction.response.edit_message(content=self.build_text(), view=self, suppress_embeds=True)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
     @discord.ui.button(label="🔢 К странице", style=discord.ButtonStyle.success)
     async def jump_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -444,8 +448,7 @@ class PlayerControls(discord.ui.View):
             await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
             return
         view = QueuePaginationView(self.guild, interaction.user.id)
-        text = view.build_text()
-        await interaction.response.send_message(text, view=view, ephemeral=True, suppress_embeds=True)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
         try:
             view.message = await interaction.original_response()
         except discord.HTTPException:

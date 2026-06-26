@@ -218,8 +218,7 @@ async def queue_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("📭 Очередь пуста.")
         return
     view = QueuePaginationView(interaction.guild, interaction.user.id)
-    text = view.build_text()
-    await interaction.response.send_message(text, view=view, ephemeral=True, suppress_embeds=True)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
     try:
         view.message = await interaction.original_response()
     except discord.HTTPException:

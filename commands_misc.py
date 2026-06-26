@@ -620,60 +620,81 @@ tree.add_command(birthday_group)
 # ─────────────────────────────────────────────
 #  Help
 # ─────────────────────────────────────────────
+HELP_CATEGORIES = {
+    "play": ("▶️", "Воспроизведение", """`/play <запрос/ссылка>` — YouTube, SoundCloud, Spotify, Яндекс
+`/skip` — пропустить (или голосование за скип)
+`/skipto <номер>` — перейти к треку очереди
+`/forward <сек>` / `/rewind <сек>` — перемотка
+`/pause` — пауза / продолжить
+`/stop` — остановить и выйти
+`/volume <0-100>` — громкость
+`/loop` — режим повтора
+`/shuffle` — перемешать очередь"""),
+    "queue": ("📋", "Очередь", """`/queue` — показать очередь (есть компактный режим)
+`/nowplaying` — что сейчас играет
+`/remove <номер>` — убрать трек из очереди
+`/history` — недавно сыгранные треки
+`/stats` — статистика прослушивания
+`/savequeue <название>` — сохранить очередь как плейлист"""),
+    "playlists": ("💾", "Плейлисты", """`/playlist create <название>` — создать плейлист
+`/playlist list` — твои плейлисты
+`/playlist play <название>` — включить плейлист
+`/playlist tracks <название>` — показать треки
+`/playlist addtrack <название>` — добавить текущий трек
+`/playlist delete <название>` — удалить плейлист
+`/playlist import <ссылка> <название>` — импорт по ссылке
+`/playlist edit <название>` — редактор: удалить трек / сменить версию
+`/playlist share <название>` — поделиться (получить код)
+`/playlist import-shared <код>` — добавить чужой плейлист по коду"""),
+    "fx": ("✨", "Эффекты и текст", """`/effect <эффект>` — bassboost, nightcore, vaporwave, slowmo, 8d
+`/lyrics` — текст текущей песни"""),
+    "settings": ("⚙️", "Настройки сервера (админ)", """`/settings show` — текущие настройки
+`/settings djrole <роль>` / `djrole_remove` — DJ-роль
+`/settings voteskip <вкл/выкл> [%]` — голосование за скип
+`/settings tracklimit <число>` — лимит треков на человека
+`/settings fairqueue <вкл/выкл>` — справедливая очередь"""),
+    "birthday": ("🎂", "День рождения", """`/birthday set` — установить свой день рождения
+`/birthday song` — выбрать поздравительный трек
+`/birthday remove` — убрать
+Бот поздравит именинника при заходе в голосовой канал"""),
+    "buttons": ("🎮", "Кнопки под «Сейчас играет»", """⏸ пауза · ⏭ скип · 🔁 повтор · 🔀 shuffle · 📋 очередь
+🔉 −10% · 🔊 +10% · 💾 в плейлист · ⏹ стоп"""),
+}
+
+
+class HelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        options = [
+            discord.SelectOption(label=title, value=key, emoji=emoji)
+            for key, (emoji, title, _) in HELP_CATEGORIES.items()
+        ]
+        sel = discord.ui.Select(placeholder="Выбери категорию команд…", options=options)
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    @staticmethod
+    def main_embed():
+        embed = discord.Embed(
+            title=f"🎵 {BOT_NAME} — помощь",
+            description="Выбери категорию в меню ниже, чтобы увидеть команды.",
+            color=BRAND_COLOR,
+        )
+        cats = " · ".join(f"{e} {t}" for e, t, _ in HELP_CATEGORIES.values())
+        embed.add_field(name="Категории", value=cats, inline=False)
+        embed.set_footer(text=BOT_NAME)
+        return embed
+
+    async def _on_select(self, interaction):
+        emoji, title, content = HELP_CATEGORIES[interaction.data["values"][0]]
+        embed = discord.Embed(title=f"{emoji} {title}", description=content, color=BRAND_COLOR)
+        embed.set_footer(text=f"{BOT_NAME} • /help")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 @tree.command(name="help", description="Список всех команд")
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title=f"🎵 {BOT_NAME} — Команды", color=discord.Color.blurple())
-    embed.add_field(name="▶️ Воспроизведение", value=
-        "`/play <запрос>` — YouTube, SoundCloud, Spotify (автоопределение)\n"
-        "`/skip` — пропустить (или начать голосование)\n"
-        "`/skipto <номер>` — перейти к треку\n"
-        "`/forward <сек>` — перемотать вперёд\n"
-        "`/rewind <сек>` — перемотать назад\n"
-        "`/pause` — пауза / продолжить\n"
-        "`/stop` — остановить и выйти",
-        inline=False
-    )
-    embed.add_field(name="🎛️ Настройки", value=
-        "`/volume <0-100>` — громкость\n"
-        "`/loop` — режим повтора\n"
-        "`/shuffle` — перемешать\n"
-        "`/effect <эффект>` — звуковой эффект\n"
-        "`/lyrics` — текст текущей песни",
-        inline=False
-    )
-    embed.add_field(name="📋 Очередь", value=
-        "`/queue` — показать очередь с пагинацией\n"
-        "`/nowplaying` — текущий трек\n"
-        "`/remove <номер>` — убрать трек\n"
-        "`/history` — история\n"
-        "`/stats` — статистика\n"
-        "`/savequeue <название>` — сохранить очередь",
-        inline=False
-    )
-    embed.add_field(name="💾 Плейлисты", value=
-        "`/playlist create/list/play/delete/tracks/addtrack`",
-        inline=False
-    )
-    embed.add_field(name="⚙️ Настройки сервера (админ)", value=
-        "`/settings show` — текущие настройки\n"
-        "`/settings djrole <роль>` — DJ-роль\n"
-        "`/settings djrole_remove` — убрать DJ-роль\n"
-        "`/settings voteskip <вкл/выкл> [%]` — голосование\n"
-        "`/settings tracklimit <число>` — лимит треков\n"
-        "`/settings fairqueue <вкл/выкл>` — справедливая очередь",
-        inline=False
-    )
-    embed.add_field(name="🎂 День рождения", value=
-        "`/birthday set/song/remove` — бот поздравит именинника при заходе в голосовой канал",
-        inline=False
-    )
-    embed.add_field(name="🎮 Кнопки под «Сейчас играет»", value=
-        "⏸ пауза  ⏭ скип  🔁 повтор  🔀 shuffle  📋 очередь\n"
-        "🔉 −10%  🔊 +10%  💾 в плейлист  ⏹ стоп",
-        inline=False
-    )
-    embed.set_footer(text=f"{BOT_NAME} • Эффекты: bassboost, nightcore, vaporwave, slowmo, 8d")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=HelpView.main_embed(), view=HelpView(), ephemeral=True)
 
 
 @tree.error

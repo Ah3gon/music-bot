@@ -16,7 +16,7 @@ import core
 from core import *
 
 from database import db_get_settings, db_get_stats
-from helpers import apply_effect, check_dj, format_duration, full_disconnect, is_dj, make_progress_bar
+from helpers import apply_effect, check_dj, format_duration, full_disconnect, is_dj, make_progress_bar, now_playing_embed
 from lyrics import fetch_lyrics
 from views import QueuePaginationView, start_vote_skip
 
@@ -233,11 +233,7 @@ async def np_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("📭 Ничего не играет.")
         return
     t = player.current
-    link = f" — [открыть]({t.uri})" if t.uri else ""
-    progress = make_progress_bar(player.position, t.length)
-    await interaction.response.send_message(
-        f"🎵 **{t.title}**{link}\n`{progress}`"
-    )
+    await interaction.response.send_message(embed=now_playing_embed(t, player, player.position, current_effect.get(interaction.guild.id, "off")))
 
 
 @tree.command(name="lyrics", description="Показать текст текущей песни")

@@ -272,3 +272,28 @@ async def full_disconnect(guild: discord.Guild):
         except Exception as e:
             log.debug("Disconnect error: %s", e)
 
+
+def now_playing_embed(track, player, position_ms: int = 0, effect: str = "off", birthday: bool = False):
+    """Фирменная карточка «Сейчас играет» — используется и в авто-сообщении, и в /nowplaying."""
+    loop_labels = {
+        wavelink.QueueMode.normal:   "выкл ➡️",
+        wavelink.QueueMode.loop:     "трек 🔂",
+        wavelink.QueueMode.loop_all: "очередь 🔁",
+    }
+    progress = make_progress_bar(position_ms, track.length)
+    if track.uri:
+        desc = f"**[{track.title}]({track.uri})**\n`{progress}`"
+    else:
+        desc = f"**{track.title}**\n`{progress}`"
+    embed = discord.Embed(description=desc, color=BRAND_COLOR)
+    embed.set_author(name="🎵 Сейчас играет")
+    embed.add_field(name="Повтор", value=loop_labels.get(player.queue.mode, "—"), inline=True)
+    embed.add_field(name="Громкость", value=f"{player.volume}%", inline=True)
+    if effect and effect != "off":
+        embed.add_field(name="Эффект", value=EFFECTS.get(effect, effect), inline=True)
+    art = getattr(track, "artwork", None)
+    if art:
+        embed.set_thumbnail(url=art)
+    if birthday:
+        embed.set_footer(text="🎂 Поздравительный трек")
+    return embed

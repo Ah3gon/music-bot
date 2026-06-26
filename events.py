@@ -16,7 +16,7 @@ import core
 from core import *
 
 from database import db_get_birthday, db_increment_stats, init_db
-from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, is_birthday_today, make_progress_bar, start_idle_timer
+from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, is_birthday_today, make_progress_bar, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
@@ -57,25 +57,10 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
-    loop_labels = {
-        wavelink.QueueMode.normal:   "выкл ➡️",
-        wavelink.QueueMode.loop:     "трек 🔂",
-        wavelink.QueueMode.loop_all: "очередь 🔁",
-    }
     effect = current_effect.get(guild.id, "off")
-    effect_indicator = f" | ✨ **{EFFECTS[effect]}**" if effect != "off" else ""
-    birthday_indicator = "\n🎂 **Поздравительный трек**" if is_birthday_track else ""
-
-    link = f" — [открыть]({track.uri})" if track.uri else ""
-    progress = make_progress_bar(0, track.length)
-    text = (
-        f"🎵 **Сейчас играет:** {track.title}{link}\n"
-        f"`{progress}`\n"
-        f"Повтор: **{loop_labels[player.queue.mode]}** | 🔊 **{player.volume}%**"
-        f"{effect_indicator}{birthday_indicator}"
-    )
+    embed = now_playing_embed(track, player, 0, effect, is_birthday_track)
     try:
-        msg = await channel.send(text, view=PlayerControls(guild))
+        msg = await channel.send(embed=embed, view=PlayerControls(guild))
         state["now_playing_msg_id"] = msg.id
     except discord.HTTPException as e:
         log.warning("Now playing send error: %s", e)

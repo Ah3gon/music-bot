@@ -76,6 +76,7 @@ async def init_db():
             "birthday_song TEXT DEFAULT 'Happy Birthday instrumental'",
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS "
             "fair_queue BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS share_code TEXT",
         ]:
             try:
                 await conn.execute(migration)
@@ -131,6 +132,17 @@ async def db_get_playlist(user_id: int, name: str) -> Optional[dict]:
         row = await conn.fetchrow(
             "SELECT * FROM playlists WHERE user_id=$1 AND name=$2", user_id, name
         )
+        return dict(row) if row else None
+
+
+async def db_set_share_code(playlist_id: int, code: str):
+    async with core.db_pool.acquire() as conn:
+        await conn.execute("UPDATE playlists SET share_code=$2 WHERE id=$1", playlist_id, code)
+
+
+async def db_get_playlist_by_share_code(code: str) -> Optional[dict]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM playlists WHERE share_code=$1", code)
         return dict(row) if row else None
 
 
@@ -226,3 +238,4 @@ async def db_get_stats(guild_id: int) -> Optional[dict]:
     async with core.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM stats WHERE guild_id=$1", guild_id)
         return dict(row) if row else None
+

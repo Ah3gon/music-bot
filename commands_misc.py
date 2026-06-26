@@ -15,7 +15,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday
+from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
 from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_with_node_fallback
 from views import PlaylistEditView
@@ -475,6 +475,76 @@ async def pl_edit(interaction: discord.Interaction, name: str):
     view = PlaylistEditView(interaction.user.id, playlist["id"], clean, tracks)
     await interaction.response.send_message(view._text(), view=view, ephemeral=True)
     view.message = await interaction.original_response()
+
+
+@playlist_group.command(name="share", description="Поделиться плейлистом — получить код")
+@app_commands.describe(name="Название плейлиста")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
+async def pl_share(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    playlist = await db_get_playlist(interaction.user.id, clean)
+    if not playlist:
+        await interaction.response.send_message(f"❗ Плейлист **{clean}** не найден.", ephemeral=True)
+        return
+    code = playlist.get("share_code")
+    if not code:
+        for _ in range(10):
+            cand = base64.urlsafe_b64encode(os.urandom(6)).decode().rstrip("=")
+            if not await db_get_playlist_by_share_code(cand):
+                code = cand
+                break
+        if not code:
+            await interaction.response.send_message("❗ Не удалось сгенерировать код, попробуй ещё раз.", ephemeral=True)
+            return
+        await db_set_share_code(playlist["id"], code)
+    await interaction.response.send_message(
+        f"🔗 Код плейлиста **{clean}**: `{code}`\n"
+        f"Любой может добавить его себе: `/playlist import-shared {code}`\n"
+        f"_Делятся снимком треков — твои дальнейшие изменения копию не затронут._",
+        ephemeral=True,
+    )
+
+
+@playlist_group.command(name="import-shared", description="Добавить чужой плейлист по коду")
+@app_commands.describe(code="Код, которым с тобой поделились", name="(необязательно) название для копии")
+async def pl_import_shared(interaction: discord.Interaction, code: str, name: Optional[str] = None):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    src = await db_get_playlist_by_share_code(code.strip())
+    if not src:
+        await interaction.followup.send("❗ Плейлист с таким кодом не найден.", ephemeral=True)
+        return
+    tracks = await db_get_tracks(src["id"])
+    if not tracks:
+        await interaction.followup.send("📭 Этот плейлист пуст — нечего копировать.", ephemeral=True)
+        return
+    base = (_validate_playlist_name(name) if name else None) or src["name"]
+    target = base
+    new_id = await db_create_playlist(interaction.user.id, target)
+    n = 2
+    while new_id is None and n < 50:
+        target = f"{base} ({n})"
+        new_id = await db_create_playlist(interaction.user.id, target)
+        n += 1
+    if new_id is None:
+        await interaction.followup.send("❗ Не удалось создать плейлист.", ephemeral=True)
+        return
+    added = 0
+    for t in tracks:
+        await db_add_track(new_id, t["title"], t["uri"] or "", t["duration"])
+        added += 1
+    await interaction.followup.send(
+        f"✅ Плейлист скопирован как **{target}** — `{added}` треков. Играй: `/playlist play {target}`",
+        ephemeral=True,
+    )
 
 
 tree.add_command(playlist_group)

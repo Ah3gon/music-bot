@@ -618,3 +618,4 @@ async def on_app_command_error(interaction: discord.Interaction,
             await interaction.response.send_message(err_msg, ephemeral=True)
     except discord.HTTPException:
         pass
+

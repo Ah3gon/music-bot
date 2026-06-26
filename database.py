@@ -167,6 +167,25 @@ async def db_add_track(playlist_id: int, title: str, uri: str, duration: int):
         )
 
 
+async def db_delete_track(track_id: int, playlist_id: int) -> bool:
+    async with core.db_pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM playlist_tracks WHERE id=$1 AND playlist_id=$2",
+            track_id, playlist_id
+        )
+        return res.endswith("1")
+
+
+async def db_update_track(track_id: int, playlist_id: int, title: str, uri: str, duration: int) -> bool:
+    safe = max(0, min(duration, MAX_INT32))
+    async with core.db_pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE playlist_tracks SET title=$3, uri=$4, duration=$5 WHERE id=$1 AND playlist_id=$2",
+            track_id, playlist_id, title, uri, safe
+        )
+        return res.endswith("1")
+
+
 async def db_get_tracks(playlist_id: int) -> list:
     async with core.db_pool.acquire() as conn:
         rows = await conn.fetch(
@@ -207,4 +226,3 @@ async def db_get_stats(guild_id: int) -> Optional[dict]:
     async with core.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM stats WHERE guild_id=$1", guild_id)
         return dict(row) if row else None
-

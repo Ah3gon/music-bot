@@ -19,7 +19,7 @@ from core import *
 
 from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_with_node_fallback
 from views import PlaylistEditView
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 
@@ -415,17 +415,18 @@ async def pl_import(interaction: discord.Interaction, url: str, name: str):
             return
         limited = spotify_tracks[:PLAYLIST_TRACK_LIMIT]
         await msg.edit(content=f"🔍 Импортирую {len(limited)} треков (ищу на YouTube)...")
-        for i, sp in enumerate(limited, 1):
-            results, _ = await search_with_node_fallback(
-                f"{sp['artist']} - {sp['title']}", wavelink.TrackSource.YouTube
-            )
-            if results:
-                track = results[0] if isinstance(results, list) else results.tracks[0]
-                await db_add_track(playlist_id, track.title, track.uri or "", track.length)
-                added += 1
-            if i % 25 == 0:
+        queries = [f"{sp['artist']} - {sp['title']}" for sp in limited]
+        last_shown = 0
+        for j in range(0, len(queries), 5):
+            for track in await search_many_youtube(queries[j:j + 5], batch_size=5):
+                if track:
+                    await db_add_track(playlist_id, track.title, track.uri or "", track.length)
+                    added += 1
+            done = min(j + 5, len(queries))
+            if done - last_shown >= 25 and done < len(queries):
+                last_shown = done
                 try:
-                    await msg.edit(content=f"🔍 Импортирую... {i}/{len(limited)}")
+                    await msg.edit(content=f"🔍 Импортирую... {done}/{len(queries)}")
                 except discord.HTTPException:
                     pass
         note = "" if added == len(spotify_tracks) else f"\n_Spotify отдал {len(spotify_tracks)} треков (лимит/ограничение API)._"
@@ -609,24 +610,26 @@ async def pl_import_file(interaction: discord.Interaction, name: str, file: disc
     msg = await interaction.followup.send(
         f"🔍 Импортирую {len(limited)} треков из файла (ищу на YouTube)...",
         ephemeral=True, wait=True)
-    added = 0
-    for i, row in enumerate(limited, 1):
+    queries = []
+    for row in limited:
         title = (row.get(title_col) or "").strip()
         if not title:
             continue
         artist = (row.get(artist_col) or "").strip() if artist_col else ""
-        query = f"{artist} - {title}" if artist else title
-        try:
-            results, _ = await search_with_node_fallback(query, wavelink.TrackSource.YouTube)
-        except Exception:
-            results = None
-        if results:
-            track = results[0] if isinstance(results, list) else results.tracks[0]
-            await db_add_track(playlist_id, track.title, track.uri or "", track.length)
-            added += 1
-        if i % 25 == 0:
+        queries.append(f"{artist} - {title}" if artist else title)
+
+    added = 0
+    last_shown = 0
+    for j in range(0, len(queries), 5):
+        for track in await search_many_youtube(queries[j:j + 5], batch_size=5):
+            if track:
+                await db_add_track(playlist_id, track.title, track.uri or "", track.length)
+                added += 1
+        done = min(j + 5, len(queries))
+        if done - last_shown >= 25 and done < len(queries):
+            last_shown = done
             try:
-                await msg.edit(content=f"🔍 Импортирую... {i}/{len(limited)}")
+                await msg.edit(content=f"🔍 Импортирую... {done}/{len(queries)}")
             except discord.HTTPException:
                 pass
 

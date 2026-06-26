@@ -56,6 +56,23 @@ def check_imports():
     except Exception as e:
         return [f"Ошибка импорта: {type(e).__name__}: {e}"]
 
+
+def check_help_coverage():
+    """Мягкая проверка: все ли команды упомянуты в /help (HELP_CATEGORIES)."""
+    os.environ.setdefault("DISCORD_TOKEN", "dummy")
+    try:
+        botmod = importlib.import_module("bot")
+        help_text = open("commands_misc.py").read()
+        missing = []
+        for c in botmod.tree.walk_commands():
+            name = c.qualified_name
+            leaf = name.split()[-1]
+            if f"/{name}" not in help_text and leaf not in help_text:
+                missing.append(name)
+        return sorted(missing)
+    except Exception as e:
+        return [f"(не удалось проверить: {e})"]
+
 print("=== Surge: быстрая проверка ===\n")
 ok = True
 for label, fn in [("Синтаксис", check_syntax),
@@ -68,5 +85,13 @@ for label, fn in [("Синтаксис", check_syntax),
         for r in res[:20]: print(f"    {r}")
     else:
         print(f"✓ {label}: чисто")
+missing_help = check_help_coverage()
+if missing_help:
+    print("\n⚠️  В /help, возможно, не хватает команд (не блокирует деплой):")
+    for m in missing_help:
+        print(f"    {m}")
+else:
+    print("\n✓ /help покрывает все команды")
+
 print("\n" + ("✅ ВСЁ ЧИСТО — можно коммитить" if ok else "⚠️ Есть проблемы — см. выше"))
 sys.exit(0 if ok else 1)

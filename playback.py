@@ -235,3 +235,27 @@ async def ensure_voice_connection(
     cancel_empty_channel_timer(interaction.guild_id)
     return player
 
+
+async def search_many_youtube(queries: list, batch_size: int = 5) -> list:
+    """Ищет список запросов на YouTube пачками (параллельно), сохраняя порядок.
+    Возвращает список треков; None — если по запросу ничего не найдено."""
+    found = []
+
+    async def _one(q):
+        try:
+            r, _ = await search_with_node_fallback(q, wavelink.TrackSource.YouTube)
+        except Exception:
+            return None
+        if not r:
+            return None
+        if isinstance(r, list):
+            return r[0] if r else None
+        tracks = getattr(r, "tracks", None)
+        if tracks:
+            return tracks[0]
+        return None
+
+    for i in range(0, len(queries), batch_size):
+        batch = queries[i:i + batch_size]
+        found.extend(await asyncio.gather(*(_one(q) for q in batch)))
+    return found

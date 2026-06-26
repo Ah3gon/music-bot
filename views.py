@@ -157,6 +157,7 @@ class QueuePaginationView(discord.ui.View):
         self.guild = guild
         self.user_id = user_id
         self.current_page = 0
+        self.compact = False
         self.message: Optional[discord.Message] = None
 
     async def on_error(self, interaction: discord.Interaction,
@@ -170,6 +171,10 @@ class QueuePaginationView(discord.ui.View):
     def player(self) -> Optional[wavelink.Player]:
         return self.guild.voice_client
 
+    @property
+    def per_page(self) -> int:
+        return 20 if self.compact else TRACKS_PER_PAGE
+
     def get_queue_snapshot(self) -> list:
         p = self.player
         if not p:
@@ -180,7 +185,7 @@ class QueuePaginationView(discord.ui.View):
         snapshot = self.get_queue_snapshot()
         if not snapshot:
             return 1
-        return max(1, (len(snapshot) + TRACKS_PER_PAGE - 1) // TRACKS_PER_PAGE)
+        return max(1, (len(snapshot) + self.per_page - 1) // self.per_page)
 
     def build_embed(self) -> discord.Embed:
         p = self.player
@@ -205,14 +210,18 @@ class QueuePaginationView(discord.ui.View):
             self._update_buttons(total_pages)
             return embed
 
-        start = self.current_page * TRACKS_PER_PAGE
-        end = start + TRACKS_PER_PAGE
+        start = self.current_page * self.per_page
+        end = start + self.per_page
         shown = snapshot[start:end]
 
         lines = []
         for i, t in enumerate(shown, start=start + 1):
-            link = f" — [открыть]({t.uri})" if t.uri else ""
-            lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`{link}")
+            if self.compact:
+                title = t.title if len(t.title) <= 58 else t.title[:57] + "…"
+                lines.append(f"`{i}.` {title}")
+            else:
+                link = f" — [открыть]({t.uri})" if t.uri else ""
+                lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`{link}")
         embed.description = "\n".join(lines)
         embed.set_footer(
             text=f"{len(snapshot)} треков · страница {self.current_page + 1}/{total_pages}")
@@ -226,6 +235,7 @@ class QueuePaginationView(discord.ui.View):
         self.next_btn.disabled = self.current_page >= total_pages - 1
         self.last_btn.disabled = self.current_page >= total_pages - 1
         self.jump_btn.disabled = total_pages <= 1
+        self.compact_btn.label = "📋 Подробно" if self.compact else "📑 Компактно"
 
     async def on_timeout(self):
         if self.message:
@@ -257,6 +267,12 @@ class QueuePaginationView(discord.ui.View):
     @discord.ui.button(label="🔢 К странице", style=discord.ButtonStyle.success)
     async def jump_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(JumpToPageModal(self))
+
+    @discord.ui.button(label="📑 Компактно", style=discord.ButtonStyle.secondary)
+    async def compact_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.compact = not self.compact
+        self.current_page = 0
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 # ─────────────────────────────────────────────

@@ -160,6 +160,25 @@ tree.add_command(settings_group)
 playlist_group = app_commands.Group(name="playlist", description="Личные плейлисты")
 
 
+async def _playlist_name_autocomplete(interaction: discord.Interaction, current: str):
+    """Подсказывает плейлисты пользователя при вводе названия."""
+    if not core.db_pool:
+        return []
+    try:
+        playlists = await db_get_user_playlists(interaction.user.id)
+    except Exception:
+        return []
+    cur = current.lower()
+    out = []
+    for p in playlists:
+        if cur in p["name"].lower():
+            label = f"{p['name']} ({p['track_count']} треков)"
+            out.append(app_commands.Choice(name=label[:100], value=p["name"]))
+        if len(out) >= 25:
+            break
+    return out
+
+
 def _validate_playlist_name(name: str) -> Optional[str]:
     if not name:
         return None
@@ -210,6 +229,7 @@ async def pl_list(interaction: discord.Interaction):
 
 @playlist_group.command(name="play", description="Воспроизвести плейлист")
 @app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
 async def pl_play(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -274,6 +294,7 @@ async def pl_play(interaction: discord.Interaction, name: str):
 
 @playlist_group.command(name="delete", description="Удалить плейлист")
 @app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
 async def pl_delete(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -293,6 +314,7 @@ async def pl_delete(interaction: discord.Interaction, name: str):
 
 @playlist_group.command(name="addtrack", description="Добавить текущий трек в плейлист")
 @app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
 async def pl_addtrack(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -320,6 +342,7 @@ async def pl_addtrack(interaction: discord.Interaction, name: str):
 
 @playlist_group.command(name="tracks", description="Треки плейлиста")
 @app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_playlist_name_autocomplete)
 async def pl_tracks(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)

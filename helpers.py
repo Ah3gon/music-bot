@@ -291,9 +291,15 @@ def now_playing_embed(track, player, position_ms: int = 0, effect: str = "off", 
     embed.add_field(name="Громкость", value=f"{player.volume}%", inline=True)
     if effect and effect != "off":
         embed.add_field(name="Эффект", value=EFFECTS.get(effect, effect), inline=True)
+    try:
+        nxt = player.queue[0] if len(player.queue) > 0 else None
+    except Exception:
+        nxt = None
+    if nxt is not None:
+        embed.add_field(name="⏭ Следующий в очереди", value=nxt.title[:240], inline=False)
     art = getattr(track, "artwork", None)
     if art:
-        embed.set_thumbnail(url=art)
+        embed.set_image(url=art)
     if birthday:
         embed.set_footer(text="🎂 Поздравительный трек")
     return embed

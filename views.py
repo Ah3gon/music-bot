@@ -15,7 +15,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_update_track
+from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
 from playback import connect_to_voice, search_with_node_fallback
 
@@ -283,16 +283,57 @@ class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейл
             await interaction.response.send_message("❗ Название не может быть пустым.", ephemeral=True)
             return
         playlist = await db_get_playlist(interaction.user.id, name)
-        if not playlist:
-            await interaction.response.send_message(
-                f"❗ Плейлист **{name}** не найден.", ephemeral=True
-            )
-            return
+        if playlist:
+            pid = playlist["id"]
+        else:
+            pid = await db_create_playlist(interaction.user.id, name)
+            if pid is None:
+                await interaction.response.send_message("❗ Не удалось создать плейлист.", ephemeral=True)
+                return
         track = player.current
-        await db_add_track(playlist["id"], track.title, track.uri or "", track.length)
+        await db_add_track(pid, track.title, track.uri or "", track.length)
         await interaction.response.send_message(
             f"✅ **{track.title}** добавлен в **{name}**!", ephemeral=True
         )
+
+
+class AddToPlaylistView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, user_id: int, playlists: list):
+        super().__init__(timeout=60)
+        self.guild = guild
+        self.user_id = user_id
+        options = []
+        for p in playlists[:24]:
+            options.append(discord.SelectOption(
+                label=p["name"][:100],
+                value=str(p["id"]),
+                description=f"{p['track_count']} треков"[:100],
+            ))
+        options.append(discord.SelectOption(
+            label="Создать новый плейлист", value="__new__", emoji="➕"))
+        sel = discord.ui.Select(placeholder="Выбери плейлист…", options=options)
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❗ Это не твоё меню.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, interaction):
+        val = interaction.data["values"][0]
+        if val == "__new__":
+            await interaction.response.send_modal(AddToPlaylistModal(self.guild))
+            return
+        player = self.guild.voice_client
+        if not player or not player.current:
+            await interaction.response.edit_message(content="❗ Ничего не играет.", view=None)
+            return
+        track = player.current
+        await db_add_track(int(val), track.title, track.uri or "", track.length)
+        await interaction.response.edit_message(
+            content=f"✅ **{track.title}** добавлен в плейлист!", view=None)
 
 
 # ─────────────────────────────────────────────
@@ -438,7 +479,19 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(emoji="💾", style=discord.ButtonStyle.secondary, row=1, label="В плейлист")
     async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AddToPlaylistModal(self.guild))
+        player: wavelink.Player = self.guild.voice_client
+        if not player or not player.current:
+            await interaction.response.send_message("❗ Ничего не играет.", ephemeral=True)
+            return
+        if not core.db_pool:
+            await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+            return
+        playlists = await db_get_user_playlists(interaction.user.id)
+        if not playlists:
+            await interaction.response.send_modal(AddToPlaylistModal(self.guild))
+            return
+        view = AddToPlaylistView(self.guild, interaction.user.id, playlists)
+        await interaction.response.send_message("💾 Выбери плейлист:", view=view, ephemeral=True)
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=1, label="Стоп")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):

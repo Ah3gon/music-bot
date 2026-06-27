@@ -33,127 +33,6 @@ settings_group = app_commands.Group(
 )
 
 
-@settings_group.command(name="show", description="Показать текущие настройки")
-async def settings_show(interaction: discord.Interaction):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    settings = await db_get_settings(interaction.guild_id)
-    dj_role = interaction.guild.get_role(settings["dj_role_id"]) if settings.get("dj_role_id") else None
-    embed = discord.Embed(title=f"⚙️ Настройки {BOT_NAME}", color=discord.Color.blurple())
-    embed.add_field(
-        name="🎧 DJ-роль",
-        value=dj_role.mention if dj_role else "_не установлена (все могут управлять)_",
-        inline=False
-    )
-    embed.add_field(
-        name="⏭ Голосование за скип",
-        value=f"{'✅ Включено' if settings['vote_skip_enabled'] else '❌ Выключено'} | "
-              f"Порог: **{settings['vote_skip_percent']}%**",
-        inline=False
-    )
-    embed.add_field(
-        name="🎵 Лимит треков на пользователя",
-        value=f"**{settings['track_limit']}** {'треков' if settings['track_limit'] > 0 else '(без лимита)'}",
-        inline=False
-    )
-    embed.add_field(
-        name="⚖️ Справедливая очередь",
-        value=f"{'✅ Включена' if settings.get('fair_queue') else '❌ Выключена'}",
-        inline=False
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@settings_group.command(name="djrole", description="Установить DJ-роль")
-@app_commands.describe(role="Роль которая может управлять ботом")
-async def settings_djrole(interaction: discord.Interaction, role: discord.Role):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    await db_save_settings(interaction.guild_id, dj_role_id=role.id)
-    await interaction.response.send_message(
-        f"✅ DJ-роль установлена: {role.mention}\n"
-        f"Теперь только пользователи с этой ролью (и администраторы) могут управлять ботом.",
-        ephemeral=True
-    )
-
-
-@settings_group.command(name="djrole_remove", description="Убрать DJ-роль (все смогут управлять)")
-async def settings_djrole_remove(interaction: discord.Interaction):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    await db_save_settings(interaction.guild_id, dj_role_id=None)
-    await interaction.response.send_message(
-        "✅ DJ-роль убрана — теперь все могут управлять ботом.", ephemeral=True
-    )
-
-
-@settings_group.command(name="voteskip", description="Включить/выключить голосование за скип")
-@app_commands.describe(enabled="Включить голосование", percent="Процент голосов для скипа (1-100)")
-async def settings_voteskip(interaction: discord.Interaction,
-                             enabled: bool, percent: int = 50):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    if not 1 <= percent <= 100:
-        await interaction.response.send_message("❗ Процент должен быть от 1 до 100.", ephemeral=True)
-        return
-    await db_save_settings(interaction.guild_id,
-                           vote_skip_enabled=enabled,
-                           vote_skip_percent=percent)
-    status = "включено ✅" if enabled else "выключено ❌"
-    await interaction.response.send_message(
-        f"✅ Голосование за скип {status}\n"
-        f"Порог: **{percent}%** голосов слушателей.",
-        ephemeral=True
-    )
-
-
-@settings_group.command(name="tracklimit",
-                         description="Установить лимит треков на пользователя (0 = без лимита)")
-@app_commands.describe(limit="Максимум треков за сессию (0 = без лимита)")
-async def settings_tracklimit(interaction: discord.Interaction, limit: int):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    if limit < 0:
-        await interaction.response.send_message("❗ Лимит не может быть отрицательным.", ephemeral=True)
-        return
-    await db_save_settings(interaction.guild_id, track_limit=limit)
-    if limit == 0:
-        await interaction.response.send_message("✅ Лимит треков снят.", ephemeral=True)
-    else:
-        await interaction.response.send_message(
-            f"✅ Лимит установлен: **{limit} треков** на пользователя за сессию.\n"
-            f"_DJ-роль снимает лимит._",
-            ephemeral=True
-        )
-
-
-@settings_group.command(name="fairqueue", description="Справедливая очередь (чередовать треки пользователей)")
-@app_commands.describe(enabled="Включить чередование")
-async def settings_fairqueue(interaction: discord.Interaction, enabled: bool):
-    if not core.db_pool:
-        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
-        return
-    await db_save_settings(interaction.guild_id, fair_queue=enabled)
-    if enabled:
-        await interaction.response.send_message(
-            "⚖️ **Справедливая очередь включена.**\n"
-            "Когда кто-то добавляет плейлист, его треки чередуются "
-            "с треками других пользователей (через один).\n"
-            "_Одиночные треки добавляются как обычно._",
-            ephemeral=True,
-        )
-    else:
-        await interaction.response.send_message(
-            "❌ Справедливая очередь выключена. Треки ставятся подряд.",
-            ephemeral=True,
-        )
-
-
 @settings_group.command(name="panel", description="Интерактивная панель настроек сервера")
 async def settings_panel(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
@@ -754,12 +633,8 @@ HELP_CATEGORIES = {
 `/playlist import-shared <код>` — добавить чужой плейлист по коду"""),
     "fx": ("✨", "Эффекты и текст", """`/effect <эффект>` — bassboost, nightcore, vaporwave, slowmo, 8d
 `/lyrics` — текст текущей песни"""),
-    "settings": ("⚙️", "Настройки сервера (админ)", """`/settings panel` — интерактивная панель всех настроек
-`/settings show` — текущие настройки
-`/settings djrole <роль>` / `djrole_remove` — DJ-роль
-`/settings voteskip <вкл/выкл> [%]` — голосование за скип
-`/settings tracklimit <число>` — лимит треков на человека
-`/settings fairqueue <вкл/выкл>` — справедливая очередь"""),
+    "settings": ("⚙️", "Настройки сервера (админ)", """`/settings panel` — интерактивная панель всех настроек сервера
+DJ-роль · голосование за скип · громкость · таймауты · источник поиска и др."""),
     "birthday": ("🎂", "День рождения", """`/birthday set` — установить свой день рождения
 `/birthday song` — выбрать поздравительный трек
 `/birthday remove` — убрать

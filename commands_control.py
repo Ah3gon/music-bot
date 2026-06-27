@@ -11,12 +11,11 @@ import time
 import base64
 import logging
 import datetime
-from typing import Optional
 import core
 from core import *
 
 from database import db_get_settings, db_get_stats
-from helpers import apply_effect, check_dj, format_duration, full_disconnect, is_dj, make_progress_bar, now_playing_embed
+from helpers import apply_effect, check_dj, format_duration, full_disconnect, is_dj, now_playing_embed
 from lyrics import fetch_lyrics
 from views import QueuePaginationView, start_vote_skip
 

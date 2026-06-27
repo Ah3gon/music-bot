@@ -95,17 +95,6 @@ def parse_spotify_url(url: str) -> Optional[tuple]:
     return None
 
 
-def is_spotify_owned_playlist(parsed: tuple) -> bool:
-    """
-    С 27 ноября 2024 Spotify заблокировал API-доступ к своим алгоритмическим
-    и редакционным плейлистам (Discover Weekly, Daily Mix, "X: радио" и т.д.)
-    Их ID обычно начинаются с '37i9dQZF1'.
-    """
-    if not parsed or parsed[0] != "playlist":
-        return False
-    return parsed[1].startswith("37i9dQZF1")
-
-
 async def fetch_spotify_tracks(url: str) -> tuple[Optional[list], Optional[str]]:
     """
     Возвращает (tracks, error_reason).

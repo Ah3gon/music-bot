@@ -11,7 +11,6 @@ import time
 import base64
 import logging
 import datetime
-from typing import Optional
 import core
 from core import *
 

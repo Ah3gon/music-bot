@@ -20,7 +20,7 @@ from core import *
 from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
 from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_with_node_fallback
-from views import PlaylistEditView
+from views import PlaylistEditView, SettingsPanelView
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 
 # ─────────────────────────────────────────────
@@ -152,6 +152,19 @@ async def settings_fairqueue(interaction: discord.Interaction, enabled: bool):
             "❌ Справедливая очередь выключена. Треки ставятся подряд.",
             ephemeral=True,
         )
+
+
+@settings_group.command(name="panel", description="Интерактивная панель настроек сервера")
+async def settings_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❗ Нужно право «Управление сервером».", ephemeral=True)
+        return
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    settings = await db_get_settings(interaction.guild.id)
+    view = SettingsPanelView(interaction.guild, settings)
+    await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 tree.add_command(settings_group)
@@ -735,12 +748,14 @@ HELP_CATEGORIES = {
 `/playlist addtrack <название>` — добавить текущий трек
 `/playlist delete <название>` — удалить плейлист
 `/playlist import <ссылка> <название>` — импорт по ссылке
+`/playlist import-file <название>` — импорт из CSV-файла (большие Spotify-плейлисты)
 `/playlist edit <название>` — редактор: удалить трек / сменить версию
 `/playlist share <название>` — поделиться (получить код)
 `/playlist import-shared <код>` — добавить чужой плейлист по коду"""),
     "fx": ("✨", "Эффекты и текст", """`/effect <эффект>` — bassboost, nightcore, vaporwave, slowmo, 8d
 `/lyrics` — текст текущей песни"""),
-    "settings": ("⚙️", "Настройки сервера (админ)", """`/settings show` — текущие настройки
+    "settings": ("⚙️", "Настройки сервера (админ)", """`/settings panel` — интерактивная панель всех настроек
+`/settings show` — текущие настройки
 `/settings djrole <роль>` / `djrole_remove` — DJ-роль
 `/settings voteskip <вкл/выкл> [%]` — голосование за скип
 `/settings tracklimit <число>` — лимит треков на человека

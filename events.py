@@ -15,7 +15,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_get_birthday, db_increment_stats, init_db
+from database import db_get_birthday, db_get_settings, db_increment_stats, init_db
 from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, is_birthday_today, make_progress_bar, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
@@ -57,13 +57,15 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
-    effect = current_effect.get(guild.id, "off")
-    embed = now_playing_embed(track, player, 0, effect, is_birthday_track)
-    try:
-        msg = await channel.send(embed=embed, view=PlayerControls(guild))
-        state["now_playing_msg_id"] = msg.id
-    except discord.HTTPException as e:
-        log.warning("Now playing send error: %s", e)
+    settings = await db_get_settings(guild.id)
+    if settings.get("announce_now_playing", True):
+        effect = current_effect.get(guild.id, "off")
+        embed = now_playing_embed(track, player, 0, effect, is_birthday_track)
+        try:
+            msg = await channel.send(embed=embed, view=PlayerControls(guild))
+            state["now_playing_msg_id"] = msg.id
+        except discord.HTTPException as e:
+            log.warning("Now playing send error: %s", e)
 
 
 @bot.event

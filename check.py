@@ -61,11 +61,15 @@ def check_help_coverage():
     """Мягкая проверка: все ли команды упомянуты в /help (HELP_CATEGORIES)."""
     os.environ.setdefault("DISCORD_TOKEN", "dummy")
     try:
+        importlib.import_module("bot")
+        cm = importlib.import_module("commands_misc")
         botmod = importlib.import_module("bot")
-        help_text = open("commands_misc.py").read()
+        help_text = " ".join(c for _, _, c in cm.HELP_CATEGORIES.values())
         missing = []
         for c in botmod.tree.walk_commands():
             name = c.qualified_name
+            if name == "help":
+                continue
             leaf = name.split()[-1]
             if f"/{name}" not in help_text and leaf not in help_text:
                 missing.append(name)

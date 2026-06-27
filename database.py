@@ -77,6 +77,7 @@ async def init_db():
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS "
             "fair_queue BOOLEAN DEFAULT FALSE",
             "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS share_code TEXT",
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS announce_now_playing BOOLEAN DEFAULT TRUE",
         ]:
             try:
                 await conn.execute(migration)
@@ -98,6 +99,7 @@ async def db_get_settings(guild_id: int) -> dict:
             "vote_skip_percent": 50,
             "track_limit": 0,
             "fair_queue": False,
+            "announce_now_playing": True,
         }
 
 

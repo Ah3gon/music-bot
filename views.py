@@ -15,7 +15,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_update_track
+from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
 from playback import connect_to_voice, search_with_node_fallback
 
@@ -832,3 +832,138 @@ class VersionSelectView(discord.ui.View):
     async def _cancel(self, interaction):
         self.editor._build()
         await interaction.response.edit_message(content=self.editor._text(), view=self.editor)
+
+
+PANEL_TOGGLES = {
+    "vote_skip_enabled": "Голосование за скип",
+    "fair_queue": "Справедливая очередь",
+    "announce_now_playing": "Объявлять «сейчас играет»",
+}
+PANEL_NUMBERS = {
+    "vote_skip_percent": ("Порог голосования (%)", 1, 100),
+    "track_limit": ("Лимит треков (0 = без лимита)", 0, 50),
+}
+PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing"]
+PANEL_ADVANCED = ["vote_skip_percent", "track_limit"]
+
+
+class SettingValueModal(discord.ui.Modal):
+    def __init__(self, panel, key):
+        label, lo, hi = PANEL_NUMBERS[key]
+        super().__init__(title=label[:45])
+        self.panel = panel
+        self.key = key
+        self.lo, self.hi = lo, hi
+        self.field = discord.ui.TextInput(
+            label=f"Число от {lo} до {hi}", required=True, max_length=6)
+        self.add_item(self.field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            v = int(self.field.value)
+        except ValueError:
+            await interaction.response.send_message("❗ Нужно целое число.", ephemeral=True)
+            return
+        v = max(self.lo, min(v, self.hi))
+        await db_save_settings(self.panel.guild.id, **{self.key: v})
+        await self.panel.refresh(interaction)
+
+
+class SettingsPanelView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, settings: dict):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.settings = settings
+        self.show_all = False
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        rs = discord.ui.RoleSelect(placeholder="🎧 Выбрать DJ-роль…",
+                                   min_values=0, max_values=1, row=0)
+        rs.callback = self._on_role
+        self.add_item(rs)
+
+        keys = PANEL_MAIN + (PANEL_ADVANCED if self.show_all else [])
+        options = []
+        for k in keys:
+            if k in PANEL_TOGGLES:
+                val = self.settings.get(k, False)
+                options.append(discord.SelectOption(
+                    label=PANEL_TOGGLES[k], value=k,
+                    description="Сейчас: включено" if val else "Сейчас: выключено"))
+            else:
+                label, lo, hi = PANEL_NUMBERS[k]
+                options.append(discord.SelectOption(
+                    label=label, value=k,
+                    description=f"Сейчас: {self.settings.get(k, lo)}"))
+        sel = discord.ui.Select(placeholder="Изменить настройку…", options=options, row=1)
+        sel.callback = self._on_setting
+        self.add_item(sel)
+
+        btn = discord.ui.Button(
+            label="⚙️ Свернуть" if self.show_all else "⚙️ Все настройки",
+            style=discord.ButtonStyle.secondary, row=2)
+        btn.callback = self._toggle_all
+        self.add_item(btn)
+        reset = discord.ui.Button(label="Сбросить DJ-роль",
+                                  style=discord.ButtonStyle.secondary, row=2)
+        reset.callback = self._reset_dj
+        self.add_item(reset)
+
+    def build_embed(self):
+        s = self.settings
+        dj = f"<@&{s.get('dj_role_id')}>" if s.get("dj_role_id") else "не задана"
+        vs = (f"включено · порог {s.get('vote_skip_percent', 50)}%"
+              if s.get("vote_skip_enabled") else "выключено")
+        tl = s.get("track_limit", 0)
+        embed = discord.Embed(
+            title="⚙️ Настройки сервера",
+            description="Меняй настройки через меню и кнопки ниже.",
+            color=BRAND_COLOR)
+        embed.add_field(name="🎧 DJ-роль", value=dj, inline=True)
+        embed.add_field(name="⏭ Голосование за скип", value=vs, inline=True)
+        embed.add_field(name="⚖️ Справедливая очередь",
+                        value="включена" if s.get("fair_queue") else "выключена", inline=True)
+        embed.add_field(name="📢 Объявлять «сейчас играет»",
+                        value="да" if s.get("announce_now_playing", True) else "нет", inline=True)
+        embed.add_field(name="📏 Лимит треков на человека",
+                        value="без лимита" if not tl else str(tl), inline=True)
+        embed.set_footer(text="Доступно админам сервера")
+        return embed
+
+    async def interaction_check(self, interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message(
+                "❗ Нужно право «Управление сервером».", ephemeral=True)
+            return False
+        return True
+
+    async def refresh(self, interaction):
+        self.settings = await db_get_settings(self.guild.id)
+        self._build()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_role(self, interaction):
+        vals = interaction.data.get("values") or []
+        role_id = int(vals[0]) if vals else None
+        await db_save_settings(self.guild.id, dj_role_id=role_id)
+        await self.refresh(interaction)
+
+    async def _reset_dj(self, interaction):
+        await db_save_settings(self.guild.id, dj_role_id=None)
+        await self.refresh(interaction)
+
+    async def _toggle_all(self, interaction):
+        self.show_all = not self.show_all
+        self._build()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_setting(self, interaction):
+        key = interaction.data["values"][0]
+        if key in PANEL_TOGGLES:
+            new = not self.settings.get(key, False)
+            await db_save_settings(self.guild.id, **{key: new})
+            await self.refresh(interaction)
+        else:
+            await interaction.response.send_modal(SettingValueModal(self, key))

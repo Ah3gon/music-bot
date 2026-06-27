@@ -16,6 +16,7 @@ import core
 from core import *
 
 from helpers import cancel_empty_channel_timer, cancel_idle_timer
+from database import db_get_settings
 
 # ─────────────────────────────────────────────
 #  Определение источника
@@ -94,6 +95,11 @@ async def connect_to_voice(
             voice_channel.connect(cls=wavelink.Player, self_deaf=True),
             timeout=timeout,
         )
+        try:
+            s = await db_get_settings(voice_channel.guild.id)
+            await player.set_volume(int(s.get("default_volume") or 100))
+        except Exception:
+            pass
         return player
     except asyncio.TimeoutError:
         log.warning("connect_to_voice: таймаут (%.1fs) при подключении к %s",

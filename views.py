@@ -840,11 +840,14 @@ PANEL_TOGGLES = {
     "announce_now_playing": "Объявлять «сейчас играет»",
 }
 PANEL_NUMBERS = {
+    "default_volume": ("Громкость по умолчанию (%)", 1, 100),
     "vote_skip_percent": ("Порог голосования (%)", 1, 100),
     "track_limit": ("Лимит треков (0 = без лимита)", 0, 50),
+    "idle_timeout": ("Таймаут бездействия (сек)", 60, 3600),
+    "empty_timeout": ("Таймаут пустого канала (сек)", 10, 3600),
 }
-PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing"]
-PANEL_ADVANCED = ["vote_skip_percent", "track_limit"]
+PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume"]
+PANEL_ADVANCED = ["vote_skip_percent", "track_limit", "idle_timeout", "empty_timeout"]
 
 
 class SettingValueModal(discord.ui.Modal):
@@ -929,6 +932,12 @@ class SettingsPanelView(discord.ui.View):
                         value="да" if s.get("announce_now_playing", True) else "нет", inline=True)
         embed.add_field(name="📏 Лимит треков на человека",
                         value="без лимита" if not tl else str(tl), inline=True)
+        embed.add_field(name="🔊 Громкость по умолчанию",
+                        value=f"{s.get('default_volume', 100)}%", inline=True)
+        embed.add_field(name="⏲ Таймаут бездействия",
+                        value=f"{s.get('idle_timeout', 300)} сек", inline=True)
+        embed.add_field(name="🚪 Таймаут пустого канала",
+                        value=f"{s.get('empty_timeout', 60)} сек", inline=True)
         embed.set_footer(text="Доступно админам сервера")
         return embed
 

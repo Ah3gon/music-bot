@@ -357,8 +357,14 @@ async def on_voice_state_update(member: discord.Member,
     cancel_empty_channel_timer(member.guild.id)
 
     async def _empty_timer(guild: discord.Guild):
+        empty = EMPTY_CH_TIMEOUT
         try:
-            await asyncio.sleep(EMPTY_CH_TIMEOUT)
+            s = await db_get_settings(guild.id)
+            empty = int(s.get("empty_timeout") or EMPTY_CH_TIMEOUT)
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(empty)
         except asyncio.CancelledError:
             return
         p: wavelink.Player = guild.voice_client

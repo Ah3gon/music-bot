@@ -217,8 +217,14 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
         idle_tasks[guild.id].cancel()
 
     async def _timer():
+        idle = IDLE_TIMEOUT
         try:
-            await asyncio.sleep(IDLE_TIMEOUT)
+            s = await db_get_settings(guild.id)
+            idle = int(s.get("idle_timeout") or IDLE_TIMEOUT)
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(idle)
         except asyncio.CancelledError:
             return
         player: wavelink.Player = guild.voice_client
@@ -227,7 +233,7 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
             await player.disconnect()
             idle_tasks.pop(guild.id, None)
             try:
-                await channel.send(f"💤 Вышел — {IDLE_TIMEOUT // 60} мин тишины.")
+                await channel.send(f"💤 Вышел — {idle // 60} мин тишины.")
             except discord.HTTPException:
                 pass
 

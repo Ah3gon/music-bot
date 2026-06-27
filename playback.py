@@ -28,6 +28,15 @@ def detect_source_from_url(query: str) -> wavelink.TrackSource:
     return wavelink.TrackSource.YouTube
 
 
+def search_source_for(name: str):
+    """Источник поиска по имени настройки (для текстовых запросов)."""
+    if name == "soundcloud":
+        return wavelink.TrackSource.SoundCloud
+    if name == "yandex":
+        return "ymsearch"
+    return wavelink.TrackSource.YouTube
+
+
 async def safe_play_track(
     player: wavelink.Player,
     track,

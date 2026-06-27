@@ -15,7 +15,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_update_track
+from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_reset_settings, db_save_settings, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
 from playback import connect_to_voice, search_with_node_fallback
 
@@ -846,7 +846,14 @@ PANEL_NUMBERS = {
     "idle_timeout": ("Таймаут бездействия (сек)", 60, 3600),
     "empty_timeout": ("Таймаут пустого канала (сек)", 10, 3600),
 }
-PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume"]
+PANEL_CHOICES = {
+    "default_search_source": (
+        "Источник поиска по умолчанию",
+        ["youtube", "yandex", "soundcloud"],
+        {"youtube": "YouTube", "yandex": "Яндекс.Музыка", "soundcloud": "SoundCloud"},
+    ),
+}
+PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source"]
 PANEL_ADVANCED = ["vote_skip_percent", "track_limit", "idle_timeout", "empty_timeout"]
 
 
@@ -895,11 +902,17 @@ class SettingsPanelView(discord.ui.View):
                 options.append(discord.SelectOption(
                     label=PANEL_TOGGLES[k], value=k,
                     description="Сейчас: включено" if val else "Сейчас: выключено"))
-            else:
+            elif k in PANEL_NUMBERS:
                 label, lo, hi = PANEL_NUMBERS[k]
                 options.append(discord.SelectOption(
                     label=label, value=k,
                     description=f"Сейчас: {self.settings.get(k, lo)}"))
+            else:
+                label, opts, labels = PANEL_CHOICES[k]
+                cur = self.settings.get(k, opts[0])
+                options.append(discord.SelectOption(
+                    label=label, value=k,
+                    description=f"Сейчас: {labels.get(cur, cur)}"))
         sel = discord.ui.Select(placeholder="Изменить настройку…", options=options, row=1)
         sel.callback = self._on_setting
         self.add_item(sel)
@@ -913,6 +926,10 @@ class SettingsPanelView(discord.ui.View):
                                   style=discord.ButtonStyle.secondary, row=2)
         reset.callback = self._reset_dj
         self.add_item(reset)
+        reset_all = discord.ui.Button(label="♻️ Сбросить всё",
+                                      style=discord.ButtonStyle.danger, row=2)
+        reset_all.callback = self._reset_all
+        self.add_item(reset_all)
 
     def build_embed(self):
         s = self.settings
@@ -938,6 +955,9 @@ class SettingsPanelView(discord.ui.View):
                         value=f"{s.get('idle_timeout', 300)} сек", inline=True)
         embed.add_field(name="🚪 Таймаут пустого канала",
                         value=f"{s.get('empty_timeout', 60)} сек", inline=True)
+        _src = {"youtube": "YouTube", "yandex": "Яндекс", "soundcloud": "SoundCloud"}
+        embed.add_field(name="🔍 Источник поиска",
+                        value=_src.get(s.get("default_search_source", "youtube"), "YouTube"), inline=True)
         embed.set_footer(text="Доступно админам сервера")
         return embed
 
@@ -974,5 +994,39 @@ class SettingsPanelView(discord.ui.View):
             new = not self.settings.get(key, False)
             await db_save_settings(self.guild.id, **{key: new})
             await self.refresh(interaction)
-        else:
+        elif key in PANEL_NUMBERS:
             await interaction.response.send_modal(SettingValueModal(self, key))
+        else:
+            _label, opts, _labels = PANEL_CHOICES[key]
+            cur = self.settings.get(key, opts[0])
+            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else opts[0]
+            await db_save_settings(self.guild.id, **{key: nxt})
+            await self.refresh(interaction)
+
+    async def _reset_all(self, interaction):
+        embed = discord.Embed(
+            title="♻️ Сбросить все настройки?",
+            description="Все настройки сервера вернутся к значениям по умолчанию.\nЭто действие нельзя отменить.",
+            color=BRAND_COLOR)
+        await interaction.response.edit_message(embed=embed, view=ResetConfirmView(self))
+
+
+class ResetConfirmView(discord.ui.View):
+    def __init__(self, panel):
+        super().__init__(timeout=60)
+        self.panel = panel
+
+    async def interaction_check(self, interaction):
+        return await self.panel.interaction_check(interaction)
+
+    @discord.ui.button(label="✅ Да, сбросить", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await db_reset_settings(self.panel.guild.id)
+        self.panel.settings = await db_get_settings(self.panel.guild.id)
+        self.panel.show_all = False
+        self.panel._build()
+        await interaction.response.edit_message(embed=self.panel.build_embed(), view=self.panel)
+
+    @discord.ui.button(label="↩️ Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.panel.build_embed(), view=self.panel)

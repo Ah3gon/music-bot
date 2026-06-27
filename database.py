@@ -81,6 +81,7 @@ async def init_db():
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS default_volume INTEGER DEFAULT 100",
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS idle_timeout INTEGER DEFAULT 300",
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS empty_timeout INTEGER DEFAULT 60",
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS default_search_source TEXT DEFAULT 'youtube'",
         ]:
             try:
                 await conn.execute(migration)
@@ -106,6 +107,7 @@ async def db_get_settings(guild_id: int) -> dict:
             "default_volume": 100,
             "idle_timeout": 300,
             "empty_timeout": 60,
+            "default_search_source": "youtube",
         }
 
 
@@ -121,6 +123,12 @@ async def db_save_settings(guild_id: int, **kwargs):
             f"ON CONFLICT (guild_id) DO UPDATE SET {fields}",
             guild_id, *values
         )
+
+
+async def db_reset_settings(guild_id: int):
+    """Удаляет строку настроек — db_get_settings вернёт значения по умолчанию."""
+    async with core.db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM server_settings WHERE guild_id=$1", guild_id)
 
 
 async def db_create_playlist(user_id: int, name: str) -> Optional[int]:

@@ -15,9 +15,9 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_create_playlist
+from database import db_add_track, db_create_playlist, db_get_settings
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, parse_youtube_playlist_id, safe_play_track, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, parse_youtube_playlist_id, safe_play_track, search_source_for, search_with_node_fallback
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 from views import TrackSelectView
 
@@ -35,6 +35,14 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     msg = await interaction.followup.send(f"🔍 Ищу **{query[:100]}**...", wait=True)
 
     source = detect_source_from_url(query)
+    q_lower = query.lower()
+    is_url_query = q_lower.startswith("http") or q_lower.startswith("sc:") or q_lower.startswith("spotify:")
+    if not is_url_query:
+        try:
+            _s = await db_get_settings(interaction.guild.id)
+            source = search_source_for(_s.get("default_search_source") or "youtube")
+        except Exception:
+            pass
     search_error = None
     is_spotify_url = "spotify.com" in query.lower() or query.lower().startswith("spotify:")
 

@@ -76,6 +76,16 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS playlist_follows (
+                id                 SERIAL PRIMARY KEY,
+                follower_id        BIGINT,
+                source_playlist_id INTEGER REFERENCES playlists(id) ON DELETE CASCADE,
+                name               TEXT,
+                created_at         TIMESTAMP DEFAULT NOW(),
+                UNIQUE (follower_id, name)
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS server_settings (
                 guild_id           BIGINT PRIMARY KEY,
                 dj_role_id         BIGINT  DEFAULT NULL,
@@ -186,6 +196,50 @@ async def db_get_user_playlists(user_id: int) -> list:
             user_id
         )
         return [dict(r) for r in rows]
+
+
+async def db_add_follow(follower_id: int, source_playlist_id: int, name: str) -> Optional[int]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO playlist_follows (follower_id, source_playlist_id, name) "
+            "VALUES ($1, $2, $3) ON CONFLICT (follower_id, name) DO NOTHING RETURNING id",
+            follower_id, source_playlist_id, name
+        )
+        return row["id"] if row else None
+
+
+async def db_get_follow(follower_id: int, name: str) -> Optional[dict]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM playlist_follows WHERE follower_id=$1 AND name=$2",
+            follower_id, name
+        )
+        return dict(row) if row else None
+
+
+async def db_get_user_follows(follower_id: int) -> list:
+    async with core.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT f.id, f.name, f.source_playlist_id, p.user_id AS owner_id, "
+            "COUNT(t.id) AS track_count "
+            "FROM playlist_follows f "
+            "JOIN playlists p ON p.id = f.source_playlist_id "
+            "LEFT JOIN playlist_tracks t ON t.playlist_id = f.source_playlist_id "
+            "WHERE f.follower_id=$1 "
+            "GROUP BY f.id, f.name, f.source_playlist_id, p.user_id "
+            "ORDER BY f.created_at",
+            follower_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def db_delete_follow(follower_id: int, name: str) -> bool:
+    async with core.db_pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM playlist_follows WHERE follower_id=$1 AND name=$2",
+            follower_id, name
+        )
+        return res.split()[-1] != "0"
 
 
 async def db_delete_playlist(user_id: int, name: str) -> bool:

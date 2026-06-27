@@ -17,7 +17,7 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_track, db_create_playlist, db_delete_playlist, db_get_birthday, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
+from database import db_add_follow, db_add_track, db_create_playlist, db_delete_follow, db_delete_playlist, db_get_birthday, db_get_follow, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_follows, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
 from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_with_node_fallback
 from views import PlaylistEditView, SettingsPanelView
@@ -83,6 +83,53 @@ def _validate_playlist_name(name: str) -> Optional[str]:
     return cleaned
 
 
+async def _playable_autocomplete(interaction: discord.Interaction, current: str):
+    """Свои + отслеживаемые плейлисты."""
+    if not core.db_pool:
+        return []
+    cur = current.lower()
+    out = []
+    try:
+        for p in await db_get_user_playlists(interaction.user.id):
+            if cur in p["name"].lower():
+                out.append(app_commands.Choice(
+                    name=f"{p['name']} ({p['track_count']} треков)"[:100], value=p["name"]))
+        for fo in await db_get_user_follows(interaction.user.id):
+            if cur in fo["name"].lower():
+                out.append(app_commands.Choice(
+                    name=f"🔗 {fo['name']} ({fo['track_count']} треков)"[:100], value=fo["name"]))
+    except Exception:
+        return []
+    return out[:25]
+
+
+async def _follow_autocomplete(interaction: discord.Interaction, current: str):
+    """Только отслеживаемые плейлисты."""
+    if not core.db_pool:
+        return []
+    cur = current.lower()
+    out = []
+    try:
+        for fo in await db_get_user_follows(interaction.user.id):
+            if cur in fo["name"].lower():
+                out.append(app_commands.Choice(
+                    name=f"🔗 {fo['name']} ({fo['track_count']} треков)"[:100], value=fo["name"]))
+    except Exception:
+        return []
+    return out[:25]
+
+
+async def _resolve_playable(user_id: int, name: str):
+    """(playlist_id, display_name, is_follow) для своего или отслеживаемого плейлиста, иначе None."""
+    pl = await db_get_playlist(user_id, name)
+    if pl:
+        return pl["id"], pl["name"], False
+    fl = await db_get_follow(user_id, name)
+    if fl:
+        return fl["source_playlist_id"], fl["name"], True
+    return None
+
+
 @playlist_group.command(name="create", description="Создать плейлист")
 @app_commands.describe(name="Название")
 async def pl_create(interaction: discord.Interaction, name: str):
@@ -111,20 +158,29 @@ async def pl_list(interaction: discord.Interaction):
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
         return
     playlists = await db_get_user_playlists(interaction.user.id)
-    if not playlists:
+    follows = await db_get_user_follows(interaction.user.id)
+    if not playlists and not follows:
         await interaction.response.send_message(
             "📭 Нет плейлистов. Создай через `/playlist create`", ephemeral=True
         )
         return
-    lines = ["**Твои плейлисты:**\n"]
-    for i, p in enumerate(playlists, 1):
-        lines.append(f"`{i}.` **{p['name']}** — {p['track_count']} треков")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    lines = []
+    if playlists:
+        lines.append("**Твои плейлисты:**")
+        for i, p in enumerate(playlists, 1):
+            lines.append(f"`{i}.` **{p['name']}** — {p['track_count']} треков")
+    if follows:
+        if lines:
+            lines.append("")
+        lines.append("**Отслеживаемые (🔗 живые):**")
+        for i, fo in enumerate(follows, 1):
+            lines.append(f"`{i}.` 🔗 **{fo['name']}** — {fo['track_count']} треков")
+    await interaction.response.send_message(chr(10).join(lines), ephemeral=True)
 
 
 @playlist_group.command(name="play", description="Воспроизвести плейлист")
 @app_commands.describe(name="Название")
-@app_commands.autocomplete(name=_playlist_name_autocomplete)
+@app_commands.autocomplete(name=_playable_autocomplete)
 async def pl_play(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -137,11 +193,12 @@ async def pl_play(interaction: discord.Interaction, name: str):
     if not interaction.user.voice:
         await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
         return
-    playlist = await db_get_playlist(interaction.user.id, clean)
-    if not playlist:
+    resolved = await _resolve_playable(interaction.user.id, clean)
+    if not resolved:
         await interaction.followup.send(f"❗ Плейлист **{clean}** не найден.")
         return
-    tracks = await db_get_tracks(playlist["id"])
+    pl_id, clean, _is_follow = resolved
+    tracks = await db_get_tracks(pl_id)
     if not tracks:
         await interaction.followup.send(f"❗ Плейлист **{clean}** пуст.")
         return
@@ -237,7 +294,7 @@ async def pl_addtrack(interaction: discord.Interaction, name: str):
 
 @playlist_group.command(name="tracks", description="Треки плейлиста")
 @app_commands.describe(name="Название")
-@app_commands.autocomplete(name=_playlist_name_autocomplete)
+@app_commands.autocomplete(name=_playable_autocomplete)
 async def pl_tracks(interaction: discord.Interaction, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -246,13 +303,14 @@ async def pl_tracks(interaction: discord.Interaction, name: str):
     if not clean:
         await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
         return
-    playlist = await db_get_playlist(interaction.user.id, clean)
-    if not playlist:
+    resolved = await _resolve_playable(interaction.user.id, clean)
+    if not resolved:
         await interaction.response.send_message(
             f"❗ Плейлист **{clean}** не найден.", ephemeral=True
         )
         return
-    tracks = await db_get_tracks(playlist["id"])
+    pl_id, clean, _is_follow = resolved
+    tracks = await db_get_tracks(pl_id)
     if not tracks:
         await interaction.response.send_message(
             f"📭 Плейлист **{clean}** пуст.", ephemeral=True
@@ -531,6 +589,59 @@ async def pl_import_file(interaction: discord.Interaction, name: str, file: disc
     await msg.edit(content=f"✅ Импортировано в **{clean}**: `{added}` треков из файла.{note}")
 
 
+@playlist_group.command(name="follow", description="Подписаться на чужой плейлист (живые обновления)")
+@app_commands.describe(code="Код плейлиста, которым с тобой поделились")
+async def pl_follow(interaction: discord.Interaction, code: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    src = await db_get_playlist_by_share_code(code.strip())
+    if not src:
+        await interaction.followup.send("❗ Плейлист с таким кодом не найден.", ephemeral=True)
+        return
+    if src["user_id"] == interaction.user.id:
+        await interaction.followup.send("❗ Это твой собственный плейлист.", ephemeral=True)
+        return
+    base = src["name"]
+    target = base
+    n = 2
+    fid = None
+    while n < 50:
+        owned = await db_get_playlist(interaction.user.id, target)
+        followed = await db_get_follow(interaction.user.id, target)
+        if not owned and not followed:
+            fid = await db_add_follow(interaction.user.id, src["id"], target)
+            if fid:
+                break
+        target = f"{base} ({n})"
+        n += 1
+    if fid is None:
+        await interaction.followup.send("❗ Не удалось подписаться.", ephemeral=True)
+        return
+    await interaction.followup.send(
+        f"🔗 Подписка на **{target}** оформлена — он обновляется вслед за автором. "
+        f"Играй: `/playlist play {target}`", ephemeral=True)
+
+
+@playlist_group.command(name="unfollow", description="Отписаться от плейлиста")
+@app_commands.describe(name="Название отслеживаемого плейлиста")
+@app_commands.autocomplete(name=_follow_autocomplete)
+async def pl_unfollow(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    ok = await db_delete_follow(interaction.user.id, clean)
+    if ok:
+        await interaction.response.send_message(f"🗑 Отписался от **{clean}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❗ Подписка **{clean}** не найдена.", ephemeral=True)
+
+
 tree.add_command(playlist_group)
 
 
@@ -631,7 +742,7 @@ HELP_CATEGORIES = {
 `/playlist import-file <название>` — импорт из CSV-файла (большие Spotify-плейлисты)
 `/playlist edit <название>` — редактор: удалить трек / сменить версию
 `/playlist share <название>` — поделиться (получить код)
-`/playlist import-shared <код>` — добавить чужой плейлист по коду"""),
+`/playlist import-shared <код>` — добавить чужой плейлист по коду (копия)\n`/playlist follow <код>` — подписаться на чужой плейлист (живые обновления)\n`/playlist unfollow <название>` — отписаться"""),
     "fx": ("✨", "Эффекты и текст", """`/effect <эффект>` — bassboost, nightcore, vaporwave, slowmo, 8d
 `/lyrics` — текст текущей песни"""),
     "settings": ("⚙️", "Настройки сервера (админ)", """`/settings panel` — интерактивная панель всех настроек сервера

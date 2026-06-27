@@ -61,6 +61,21 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id       BIGINT PRIMARY KEY,
+                tracks_played INTEGER DEFAULT 0,
+                total_ms      BIGINT  DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_artist_stats (
+                user_id BIGINT,
+                artist  TEXT,
+                plays   INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, artist)
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS server_settings (
                 guild_id           BIGINT PRIMARY KEY,
                 dj_role_id         BIGINT  DEFAULT NULL,
@@ -254,4 +269,39 @@ async def db_get_stats(guild_id: int) -> Optional[dict]:
     async with core.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM stats WHERE guild_id=$1", guild_id)
         return dict(row) if row else None
+
+
+async def db_increment_user_stats(user_id: int, duration_ms: int, artist: str):
+    safe = max(0, min(duration_ms, MAX_INT32))
+    async with core.db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_stats (user_id, tracks_played, total_ms) VALUES ($1, 1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "tracks_played = user_stats.tracks_played + 1, "
+            "total_ms = user_stats.total_ms + $2",
+            user_id, safe
+        )
+        if artist:
+            await conn.execute(
+                "INSERT INTO user_artist_stats (user_id, artist, plays) VALUES ($1, $2, 1) "
+                "ON CONFLICT (user_id, artist) DO UPDATE SET "
+                "plays = user_artist_stats.plays + 1",
+                user_id, artist[:200]
+            )
+
+
+async def db_get_user_stats(user_id: int) -> Optional[dict]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM user_stats WHERE user_id=$1", user_id)
+        return dict(row) if row else None
+
+
+async def db_get_user_top_artists(user_id: int, limit: int = 5) -> list:
+    async with core.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT artist, plays FROM user_artist_stats WHERE user_id=$1 "
+            "ORDER BY plays DESC LIMIT $2",
+            user_id, limit
+        )
+        return [dict(r) for r in rows]
 

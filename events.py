@@ -14,8 +14,8 @@ import datetime
 import core
 from core import *
 
-from database import db_get_birthday, db_get_settings, db_increment_stats, init_db
-from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, is_birthday_today, now_playing_embed, start_idle_timer
+from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
+from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
@@ -40,6 +40,9 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if core.db_pool:
         try:
             await db_increment_stats(guild.id, track.length)
+            owner = get_track_owner(guild.id, track)
+            if owner:
+                await db_increment_user_stats(owner, track.length, getattr(track, "author", "") or "")
         except Exception as e:
             log.warning("Stats increment error: %s", e)
 

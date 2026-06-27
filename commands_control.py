@@ -14,7 +14,7 @@ import datetime
 import core
 from core import *
 
-from database import db_get_settings, db_get_stats
+from database import db_get_settings, db_get_stats, db_get_user_stats, db_get_user_top_artists
 from helpers import apply_effect, check_dj, format_duration, full_disconnect, is_dj, now_playing_embed
 from lyrics import fetch_lyrics
 from views import QueuePaginationView, start_vote_skip
@@ -293,10 +293,38 @@ async def stats_cmd(interaction: discord.Interaction):
         return
     total_hours = stats["total_ms"] // 3600000
     total_minutes = (stats["total_ms"] % 3600000) // 60000
-    embed = discord.Embed(title=f"📊 Статистика {BOT_NAME}", color=discord.Color.blurple())
+    embed = discord.Embed(title=f"📊 Статистика {BOT_NAME}", color=BRAND_COLOR)
     embed.add_field(name="🎵 Треков сыграно", value=f"**{stats['tracks_played']}**", inline=True)
     embed.add_field(name="⏱ Общее время",
                     value=f"**{total_hours}ч {total_minutes}м**", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="mystats", description="Твоя личная статистика прослушивания")
+async def mystats_cmd(interaction: discord.Interaction):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    stats = await db_get_user_stats(interaction.user.id)
+    if not stats or not stats.get("tracks_played"):
+        await interaction.response.send_message(
+            "📭 У тебя пока нет статистики — включи пару треков!", ephemeral=True)
+        return
+    total_hours = stats["total_ms"] // 3600000
+    total_minutes = (stats["total_ms"] % 3600000) // 60000
+    top = await db_get_user_top_artists(interaction.user.id, 5)
+    embed = discord.Embed(title="📊 Твоя статистика", color=BRAND_COLOR)
+    embed.set_author(name=interaction.user.display_name,
+                     icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="🎵 Треков сыграно",
+                    value=f"**{stats['tracks_played']}**", inline=True)
+    embed.add_field(name="⏱ Время прослушивания",
+                    value=f"**{total_hours}ч {total_minutes}м**", inline=True)
+    if top:
+        lines = [f"`{i}.` {a['artist']} — {a['plays']}" for i, a in enumerate(top, 1)]
+        embed.add_field(name="🎤 Любимые исполнители",
+                        value=chr(10).join(lines), inline=False)
+    embed.set_footer(text=BOT_NAME)
     await interaction.response.send_message(embed=embed)
 
 

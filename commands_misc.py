@@ -17,8 +17,8 @@ from typing import Optional
 import core
 from core import *
 
-from database import db_add_follow, db_add_track, db_create_playlist, db_delete_follow, db_delete_playlist, db_get_birthday, db_get_follow, db_get_playlist, db_get_playlist_by_share_code, db_get_settings, db_get_tracks, db_get_user_follows, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
-from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
+from database import db_add_follow, db_add_server_track, db_add_track, db_create_playlist, db_create_server_playlist, db_delete_follow, db_delete_playlist, db_delete_server_playlist, db_get_birthday, db_get_follow, db_get_playlist, db_get_playlist_by_share_code, db_get_server_playlist, db_get_server_playlists, db_get_server_tracks, db_get_settings, db_get_tracks, db_get_user_follows, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
+from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
 from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_with_node_fallback
 from views import PlaylistEditView, SettingsPanelView
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
@@ -53,6 +53,7 @@ tree.add_command(settings_group)
 #  Плейлисты
 # ─────────────────────────────────────────────
 playlist_group = app_commands.Group(name="playlist", description="Личные плейлисты")
+splaylist_group = app_commands.Group(name="splaylist", description="Серверные плейлисты (общие)")
 
 
 async def _playlist_name_autocomplete(interaction: discord.Interaction, current: str):
@@ -128,6 +129,28 @@ async def _resolve_playable(user_id: int, name: str):
     if fl:
         return fl["source_playlist_id"], fl["name"], True
     return None
+
+
+async def _splaylist_autocomplete(interaction: discord.Interaction, current: str):
+    """Серверные плейлисты текущего сервера."""
+    if not core.db_pool or not interaction.guild:
+        return []
+    cur = current.lower()
+    out = []
+    try:
+        for p in await db_get_server_playlists(interaction.guild.id):
+            if cur in p["name"].lower():
+                out.append(app_commands.Choice(
+                    name=f"{p['name']} ({p['track_count']} треков)"[:100], value=p["name"]))
+    except Exception:
+        return []
+    return out[:25]
+
+
+async def _can_edit_splaylist(interaction: discord.Interaction, pl: dict) -> bool:
+    if pl.get("creator_id") == interaction.user.id:
+        return True
+    return await is_dj(interaction.user)
 
 
 @playlist_group.command(name="create", description="Создать плейлист")
@@ -642,7 +665,181 @@ async def pl_unfollow(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(f"❗ Подписка **{clean}** не найдена.", ephemeral=True)
 
 
+@splaylist_group.command(name="create", description="Создать серверный плейлист (общий для сервера)")
+@app_commands.describe(name="Название")
+async def spl_create(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    pid = await db_create_server_playlist(interaction.guild.id, interaction.user.id, clean)
+    if pid is None:
+        await interaction.response.send_message(
+            f"❗ Серверный плейлист **{clean}** уже существует.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"✅ Серверный плейлист **{clean}** создан! Добавляй треки: `/splaylist addtrack {clean}`",
+        ephemeral=True)
+
+
+@splaylist_group.command(name="list", description="Серверные плейлисты")
+async def spl_list(interaction: discord.Interaction):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    pls = await db_get_server_playlists(interaction.guild.id)
+    if not pls:
+        await interaction.response.send_message(
+            "📭 На сервере нет общих плейлистов. Создай: `/splaylist create`", ephemeral=True)
+        return
+    lines = ["**Серверные плейлисты:**"]
+    for i, p in enumerate(pls, 1):
+        lines.append(f"`{i}.` **{p['name']}** — {p['track_count']} треков · <@{p['creator_id']}>")
+    await interaction.response.send_message(chr(10).join(lines), ephemeral=True)
+
+
+@splaylist_group.command(name="tracks", description="Треки серверного плейлиста")
+@app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_splaylist_autocomplete)
+async def spl_tracks(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    pl = await db_get_server_playlist(interaction.guild.id, clean)
+    if not pl:
+        await interaction.response.send_message(f"❗ Плейлист **{clean}** не найден.", ephemeral=True)
+        return
+    tracks = await db_get_server_tracks(pl["id"])
+    if not tracks:
+        await interaction.response.send_message(f"📭 Плейлист **{clean}** пуст.", ephemeral=True)
+        return
+    lines = [f"**{clean}** — {len(tracks)} треков", ""]
+    for t in tracks[:PLAYLIST_TRACKS_SHOW]:
+        lines.append(f"`{t['position']}.` {t['title']} `[{format_duration(t['duration'])}]`")
+    if len(tracks) > PLAYLIST_TRACKS_SHOW:
+        lines.append(f"_...и ещё {len(tracks) - PLAYLIST_TRACKS_SHOW} треков_")
+    await interaction.response.send_message(chr(10).join(lines), ephemeral=True)
+
+
+@splaylist_group.command(name="addtrack", description="Добавить текущий трек в серверный плейлист")
+@app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_splaylist_autocomplete)
+async def spl_addtrack(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    pl = await db_get_server_playlist(interaction.guild.id, clean)
+    if not pl:
+        await interaction.response.send_message(f"❗ Плейлист **{clean}** не найден.", ephemeral=True)
+        return
+    if not await _can_edit_splaylist(interaction, pl):
+        await interaction.response.send_message(
+            "❗ Редактировать может только создатель, DJ или админ.", ephemeral=True)
+        return
+    player: wavelink.Player = interaction.guild.voice_client
+    if not player or not player.current:
+        await interaction.response.send_message("❗ Сейчас ничего не играет.", ephemeral=True)
+        return
+    t = player.current
+    await db_add_server_track(pl["id"], t.title, t.uri or "", t.length)
+    await interaction.response.send_message(f"✅ **{t.title}** добавлен в **{clean}**.", ephemeral=True)
+
+
+@splaylist_group.command(name="delete", description="Удалить серверный плейлист")
+@app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_splaylist_autocomplete)
+async def spl_delete(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.response.send_message("❗ Неверное название.", ephemeral=True)
+        return
+    pl = await db_get_server_playlist(interaction.guild.id, clean)
+    if not pl:
+        await interaction.response.send_message(f"❗ Плейлист **{clean}** не найден.", ephemeral=True)
+        return
+    if not await _can_edit_splaylist(interaction, pl):
+        await interaction.response.send_message(
+            "❗ Удалить может только создатель, DJ или админ.", ephemeral=True)
+        return
+    await db_delete_server_playlist(pl["id"])
+    await interaction.response.send_message(f"🗑 Серверный плейлист **{clean}** удалён.", ephemeral=True)
+
+
+@splaylist_group.command(name="play", description="Воспроизвести серверный плейлист")
+@app_commands.describe(name="Название")
+@app_commands.autocomplete(name=_splaylist_autocomplete)
+async def spl_play(interaction: discord.Interaction, name: str):
+    if not core.db_pool:
+        await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    clean = _validate_playlist_name(name)
+    if not clean:
+        await interaction.followup.send("❗ Неверное название.")
+        return
+    if not interaction.user.voice:
+        await interaction.followup.send("❗ Зайди в голосовой канал сначала.")
+        return
+    pl = await db_get_server_playlist(interaction.guild.id, clean)
+    if not pl:
+        await interaction.followup.send(f"❗ Плейлист **{clean}** не найден.")
+        return
+    tracks = await db_get_server_tracks(pl["id"])
+    if not tracks:
+        await interaction.followup.send(f"❗ Плейлист **{clean}** пуст.")
+        return
+    if not await check_track_limit(interaction, min(len(tracks), PLAYLIST_TRACK_LIMIT)):
+        return
+    player = await ensure_voice_connection(interaction)
+    if player is None:
+        await interaction.followup.send("❗ Не удалось подключиться к голосовому каналу.")
+        return
+    msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
+    loaded = []
+    for t in tracks[:PLAYLIST_TRACK_LIMIT]:
+        results, _ = await search_with_node_fallback(t["uri"], wavelink.TrackSource.YouTube)
+        if results:
+            track = results[0] if isinstance(results, list) else results.tracks[0]
+            loaded.append(track)
+    if not loaded:
+        await msg.edit(content=f"😕 Не удалось загрузить треки из **{clean}**.")
+        return
+    fair = await get_fair_queue_enabled(interaction.guild_id)
+    if not player.playing:
+        first = loaded[0]
+        rest = loaded[1:]
+        tag_track(interaction.guild_id, first, interaction.user.id)
+        for t in rest:
+            tag_track(interaction.guild_id, t, interaction.user.id)
+        for t in rest:
+            await player.queue.put_wait(t)
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass
+        await safe_play_track(player, first)
+    else:
+        await add_tracks_fairly(player, loaded, interaction.user.id, enabled=fair)
+        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`")
+    increment_user_track_count(interaction.guild_id, interaction.user.id, len(loaded))
+
+
 tree.add_command(playlist_group)
+tree.add_command(splaylist_group)
 
 
 # ─────────────────────────────────────────────
@@ -743,6 +940,12 @@ HELP_CATEGORIES = {
 `/playlist edit <название>` — редактор: удалить трек / сменить версию
 `/playlist share <название>` — поделиться (получить код)
 `/playlist import-shared <код>` — добавить чужой плейлист по коду (копия)\n`/playlist follow <код>` — подписаться на чужой плейлист (живые обновления)\n`/playlist unfollow <название>` — отписаться"""),
+    "splaylist": ("🌐", "Серверные плейлисты", """`/splaylist create <название>` — создать общий плейлист сервера
+`/splaylist list` — список серверных плейлистов
+`/splaylist play <название>` — воспроизвести
+`/splaylist tracks <название>` — показать треки
+`/splaylist addtrack <название>` — добавить текущий трек (создатель/DJ/админ)
+`/splaylist delete <название>` — удалить (создатель/DJ/админ)"""),
     "fx": ("✨", "Эффекты и текст", """`/effect <эффект>` — bassboost, nightcore, vaporwave, slowmo, 8d
 `/lyrics` — текст текущей песни"""),
     "settings": ("⚙️", "Настройки сервера (админ)", """`/settings panel` — интерактивная панель всех настроек сервера

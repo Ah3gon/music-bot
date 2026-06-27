@@ -86,6 +86,26 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_playlists (
+                id         SERIAL PRIMARY KEY,
+                guild_id   BIGINT,
+                creator_id BIGINT,
+                name       TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (guild_id, name)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_playlist_tracks (
+                id           SERIAL PRIMARY KEY,
+                splaylist_id INTEGER REFERENCES server_playlists(id) ON DELETE CASCADE,
+                title        TEXT,
+                uri          TEXT,
+                duration     INTEGER,
+                position     INTEGER
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS server_settings (
                 guild_id           BIGINT PRIMARY KEY,
                 dj_role_id         BIGINT  DEFAULT NULL,
@@ -239,6 +259,62 @@ async def db_delete_follow(follower_id: int, name: str) -> bool:
             "DELETE FROM playlist_follows WHERE follower_id=$1 AND name=$2",
             follower_id, name
         )
+        return res.split()[-1] != "0"
+
+
+async def db_create_server_playlist(guild_id: int, creator_id: int, name: str) -> Optional[int]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO server_playlists (guild_id, creator_id, name) VALUES ($1, $2, $3) "
+            "ON CONFLICT (guild_id, name) DO NOTHING RETURNING id",
+            guild_id, creator_id, name
+        )
+        return row["id"] if row else None
+
+
+async def db_get_server_playlist(guild_id: int, name: str) -> Optional[dict]:
+    async with core.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM server_playlists WHERE guild_id=$1 AND name=$2", guild_id, name
+        )
+        return dict(row) if row else None
+
+
+async def db_get_server_playlists(guild_id: int) -> list:
+    async with core.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT s.id, s.name, s.creator_id, COUNT(t.id) AS track_count "
+            "FROM server_playlists s LEFT JOIN server_playlist_tracks t ON s.id=t.splaylist_id "
+            "WHERE s.guild_id=$1 GROUP BY s.id ORDER BY s.created_at", guild_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def db_add_server_track(splaylist_id: int, title: str, uri: str, duration: int):
+    safe = max(0, min(duration, MAX_INT32))
+    async with core.db_pool.acquire() as conn:
+        pos = await conn.fetchval(
+            "SELECT COALESCE(MAX(position),0)+1 FROM server_playlist_tracks WHERE splaylist_id=$1",
+            splaylist_id
+        )
+        await conn.execute(
+            "INSERT INTO server_playlist_tracks (splaylist_id,title,uri,duration,position) "
+            "VALUES ($1,$2,$3,$4,$5)", splaylist_id, title, uri, safe, pos
+        )
+
+
+async def db_get_server_tracks(splaylist_id: int) -> list:
+    async with core.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM server_playlist_tracks WHERE splaylist_id=$1 ORDER BY position",
+            splaylist_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def db_delete_server_playlist(splaylist_id: int) -> bool:
+    async with core.db_pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM server_playlists WHERE id=$1", splaylist_id)
         return res.split()[-1] != "0"
 
 

@@ -15,7 +15,7 @@ import core
 from core import *
 
 from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
-from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
+from helpers import add_to_history, cancel_empty_channel_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
@@ -348,8 +348,9 @@ async def on_voice_state_update(member: discord.Member,
     if not player or not player.channel:
         return
     if after.channel and after.channel == player.channel:
-        cancel_idle_timer(member.guild.id)
-        cancel_empty_channel_timer(member.guild.id)
+        # Реагируем только на реальный вход в канал (а не мьют/анмьют и т.п.)
+        if before.channel != after.channel:
+            cancel_empty_channel_timer(member.guild.id)
         return
 
     non_bots = [m for m in player.channel.members if not m.bot]

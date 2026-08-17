@@ -1002,11 +1002,40 @@ class SettingsPanelView(discord.ui.View):
         elif key in PANEL_NUMBERS:
             await interaction.response.send_modal(SettingValueModal(self, key))
         else:
-            _label, opts, _labels = PANEL_CHOICES[key]
+            label, opts, labels = PANEL_CHOICES[key]
             cur = self.settings.get(key, opts[0])
-            nxt = opts[(opts.index(cur) + 1) % len(opts)] if cur in opts else opts[0]
-            await db_save_settings(self.guild.id, **{key: nxt})
-            await self.refresh(interaction)
+            options = [
+                discord.SelectOption(
+                    label=labels.get(o, o), value=o,
+                    default=(o == cur))
+                for o in opts
+            ]
+            sel = discord.ui.Select(placeholder=label[:100], options=options)
+
+            async def _pick(inner, _key=key):
+                await db_save_settings(self.guild.id,
+                                       **{_key: inner.data["values"][0]})
+                self.settings = await db_get_settings(self.guild.id)
+                self._build()
+                await inner.response.edit_message(
+                    embed=self.build_embed(), view=self)
+
+            sel.callback = _pick
+            picker = discord.ui.View(timeout=60)
+            picker.add_item(sel)
+            back = discord.ui.Button(label="↩️ Назад", style=discord.ButtonStyle.secondary)
+
+            async def _back(inner):
+                self._build()
+                await inner.response.edit_message(embed=self.build_embed(), view=self)
+
+            back.callback = _back
+            picker.add_item(back)
+            embed = discord.Embed(
+                title=f"⚙️ {label}",
+                description="Выбери значение в меню ниже. / Pick a value below.",
+                color=BRAND_COLOR)
+            await interaction.response.edit_message(embed=embed, view=picker)
 
     async def _reset_all(self, interaction):
         embed = discord.Embed(

@@ -847,13 +847,18 @@ PANEL_NUMBERS = {
     "empty_timeout": ("Таймаут пустого канала (сек)", 10, 3600),
 }
 PANEL_CHOICES = {
+    "language": (
+        "Язык бота / Bot language",
+        ["ru", "en"],
+        {"ru": "Русский", "en": "English"},
+    ),
     "default_search_source": (
         "Источник поиска по умолчанию",
         ["youtube", "yandex", "soundcloud"],
         {"youtube": "YouTube", "yandex": "Яндекс.Музыка", "soundcloud": "SoundCloud"},
     ),
 }
-PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source"]
+PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source", "language"]
 PANEL_ADVANCED = ["vote_skip_percent", "track_limit", "idle_timeout", "empty_timeout"]
 
 

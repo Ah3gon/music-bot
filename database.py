@@ -14,6 +14,7 @@ import datetime
 from typing import Optional
 import core
 from core import *
+from i18n import set_cached_lang
 
 
 
@@ -127,6 +128,7 @@ async def init_db():
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS idle_timeout INTEGER DEFAULT 300",
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS empty_timeout INTEGER DEFAULT 60",
             "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS default_search_source TEXT DEFAULT 'youtube'",
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'",
         ]:
             try:
                 await conn.execute(migration)
@@ -140,7 +142,9 @@ async def db_get_settings(guild_id: int) -> dict:
             "SELECT * FROM server_settings WHERE guild_id=$1", guild_id
         )
         if row:
-            return dict(row)
+            data = dict(row)
+            set_cached_lang(guild_id, data.get("language") or "ru")
+            return data
         return {
             "guild_id": guild_id,
             "dj_role_id": None,
@@ -153,12 +157,15 @@ async def db_get_settings(guild_id: int) -> dict:
             "idle_timeout": 300,
             "empty_timeout": 60,
             "default_search_source": "youtube",
+            "language": "ru",
         }
 
 
 async def db_save_settings(guild_id: int, **kwargs):
     if not kwargs:
         return
+    if "language" in kwargs:
+        set_cached_lang(guild_id, kwargs["language"])
     fields = ", ".join(f"{k}=${i+2}" for i, k in enumerate(kwargs))
     values = list(kwargs.values())
     async with core.db_pool.acquire() as conn:

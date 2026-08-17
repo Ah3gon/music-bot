@@ -15,7 +15,7 @@ import core
 from core import *
 
 from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
-from helpers import add_to_history, cancel_empty_channel_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
+from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
@@ -31,6 +31,7 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         return
     track = payload.track
     guild = player.guild
+    cancel_idle_timer(guild.id)
     state = get_player_state(guild.id)
 
     is_birthday_track = state.get("birthday_playing", False)

@@ -221,23 +221,37 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
         try:
             s = await db_get_settings(guild.id)
             idle = int(s.get("idle_timeout") or IDLE_TIMEOUT)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Idle-таймер %s: ошибка чтения настроек: %s", guild.id, e)
         try:
             await asyncio.sleep(idle)
         except asyncio.CancelledError:
             return
+        idle_tasks.pop(guild.id, None)
         player: wavelink.Player = guild.voice_client
-        if player and not player.playing and not player.paused:
-            clear_player_state(guild.id)
-            await player.disconnect()
-            idle_tasks.pop(guild.id, None)
-            try:
-                await channel.send(f"💤 Вышел — {idle // 60} мин тишины.")
-            except discord.HTTPException:
-                pass
+        if not player:
+            log.warning("Idle-таймер %s: voice_client=None — отключать нечего", guild.id)
+            return
+        if player.playing or player.paused:
+            log.info(
+                "Idle-таймер %s: музыка активна (playing=%s, paused=%s, current=%s) — остаюсь",
+                guild.id, player.playing, player.paused,
+                getattr(getattr(player, "current", None), "title", None),
+            )
+            return
+        log.info("Idle-таймер %s: тишина %s сек — выхожу из канала", guild.id, idle)
+        try:
+            await full_disconnect(guild)
+        except Exception as e:
+            log.warning("Idle-таймер %s: ошибка отключения: %s", guild.id, e)
+            return
+        try:
+            await channel.send(f"💤 Вышел — {idle // 60} мин тишины.")
+        except discord.HTTPException:
+            pass
 
     idle_tasks[guild.id] = asyncio.create_task(_timer())
+    log.info("Idle-таймер %s: запущен", guild.id)
 
 
 def cancel_idle_timer(guild_id: int):

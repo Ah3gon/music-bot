@@ -16,6 +16,7 @@ import core
 from core import *
 
 from database import db_get_settings
+from i18n import t
 
 # ─────────────────────────────────────────────
 #  Проверка прав DJ
@@ -35,10 +36,11 @@ async def is_dj(member: discord.Member) -> bool:
 async def check_dj(interaction: discord.Interaction) -> bool:
     if not await is_dj(interaction.user):
         if interaction.response.is_done():
-            await interaction.followup.send("❗ Для этого нужна роль **DJ**.", ephemeral=True)
+            await interaction.followup.send(
+                t(interaction.guild_id, "err.dj_required"), ephemeral=True)
         else:
             await interaction.response.send_message(
-                "❗ Для этого нужна роль **DJ**.", ephemeral=True
+                t(interaction.guild_id, "err.dj_required"), ephemeral=True
             )
         return False
     return True
@@ -73,10 +75,7 @@ async def check_track_limit(interaction: discord.Interaction, count: int = 1) ->
         return True
     current = get_user_track_count(interaction.guild_id, interaction.user.id)
     if current + count > limit:
-        msg = (
-            f"❗ Ты достиг лимита треков (**{limit}** за сессию). "
-            f"Дождись конца очереди или попроси DJ добавить больше."
-        )
+        msg = t(interaction.guild_id, "err.track_limit", limit=limit)
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
@@ -101,7 +100,7 @@ def cleanup_track_map(guild_id: int, keep_tracks: list):
     gmap = track_user_map.get(guild_id)
     if not gmap:
         return
-    keep_ids = {t.identifier for t in keep_tracks}
+    keep_ids = {tr.identifier for tr in keep_tracks}
     for tid in list(gmap.keys()):
         if tid not in keep_ids:
             del gmap[tid]
@@ -115,26 +114,26 @@ async def add_tracks_fairly(
 ):
     """Добавляет треки, чередуя их с чужими если fair_queue включено."""
     guild_id = player.guild.id
-    for t in tracks:
-        tag_track(guild_id, t, user_id)
+    for tr in tracks:
+        tag_track(guild_id, tr, user_id)
 
     if not enabled or len(tracks) <= 1:
-        for t in tracks:
-            await player.queue.put_wait(t)
+        for tr in tracks:
+            await player.queue.put_wait(tr)
         return
 
     existing = list(player.queue)
     foreign_tracks = [
-        t for t in existing if get_track_owner(guild_id, t) != user_id
+        tr for tr in existing if get_track_owner(guild_id, tr) != user_id
     ]
 
     # Если чужих треков < 2 — не чередуем, просто добавляем в конец
     if len(foreign_tracks) < 2:
-        for t in tracks:
-            await player.queue.put_wait(t)
+        for tr in tracks:
+            await player.queue.put_wait(tr)
         return
 
-    my_existing = [t for t in existing if get_track_owner(guild_id, t) == user_id]
+    my_existing = [tr for tr in existing if get_track_owner(guild_id, tr) == user_id]
 
     new_queue = []
     max_len = max(len(foreign_tracks), len(tracks))
@@ -149,8 +148,8 @@ async def add_tracks_fairly(
     new_queue.extend(my_existing)
 
     player.queue.clear()
-    for t in new_queue:
-        await player.queue.put_wait(t)
+    for tr in new_queue:
+        await player.queue.put_wait(tr)
     cleanup_track_map(guild_id, new_queue)
 
 
@@ -171,9 +170,10 @@ def format_duration(ms: int) -> str:
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
-def make_progress_bar(position_ms: int, length_ms: int, bar_len: int = 12) -> str:
+def make_progress_bar(position_ms: int, length_ms: int, bar_len: int = 12,
+                      guild_id: int = None) -> str:
     if length_ms <= 0:
-        return "📻 Прямой эфир"
+        return t(guild_id, "np.live")
     progress = max(0.0, min(1.0, position_ms / length_ms))
     filled = int(progress * bar_len)
     bar = "━" * filled + "🔘" + "─" * (bar_len - filled)
@@ -246,7 +246,7 @@ async def start_idle_timer(guild: discord.Guild, channel: discord.TextChannel):
             log.warning("Idle-таймер %s: ошибка отключения: %s", guild.id, e)
             return
         try:
-            await channel.send(f"💤 Вышел — {idle // 60} мин тишины.")
+            await channel.send(t(guild.id, "np.idle_leave", min=idle // 60))
         except discord.HTTPException:
             pass
 
@@ -295,31 +295,33 @@ async def full_disconnect(guild: discord.Guild):
 
 def now_playing_embed(track, player, position_ms: int = 0, effect: str = "off", birthday: bool = False):
     """Фирменная карточка «Сейчас играет» — используется и в авто-сообщении, и в /nowplaying."""
+    gid = getattr(getattr(player, "guild", None), "id", None)
     loop_labels = {
-        wavelink.QueueMode.normal:   "выкл ➡️",
-        wavelink.QueueMode.loop:     "трек 🔂",
-        wavelink.QueueMode.loop_all: "очередь 🔁",
+        wavelink.QueueMode.normal:   t(gid, "loop.short_off"),
+        wavelink.QueueMode.loop:     t(gid, "loop.short_track"),
+        wavelink.QueueMode.loop_all: t(gid, "loop.short_queue"),
     }
-    progress = make_progress_bar(position_ms, track.length)
+    progress = make_progress_bar(position_ms, track.length, guild_id=gid)
     if track.uri:
         desc = f"**[{track.title}]({track.uri})**\n`{progress}`"
     else:
         desc = f"**{track.title}**\n`{progress}`"
     embed = discord.Embed(description=desc, color=BRAND_COLOR)
-    embed.set_author(name="🎵 Сейчас играет")
-    embed.add_field(name="Повтор", value=loop_labels.get(player.queue.mode, "—"), inline=True)
-    embed.add_field(name="Громкость", value=f"{player.volume}%", inline=True)
+    embed.set_author(name=t(gid, "np.title"))
+    embed.add_field(name=t(gid, "np.loop"),
+                    value=loop_labels.get(player.queue.mode, "—"), inline=True)
+    embed.add_field(name=t(gid, "np.volume"), value=f"{player.volume}%", inline=True)
     if effect and effect != "off":
-        embed.add_field(name="Эффект", value=EFFECTS.get(effect, effect), inline=True)
+        embed.add_field(name=t(gid, "np.effect"), value=EFFECTS.get(effect, effect), inline=True)
     try:
         nxt = player.queue[0] if len(player.queue) > 0 else None
     except Exception:
         nxt = None
     if nxt is not None:
-        embed.add_field(name="⏭ Следующий в очереди", value=nxt.title[:240], inline=False)
+        embed.add_field(name=t(gid, "np.next"), value=nxt.title[:240], inline=False)
     art = getattr(track, "artwork", None)
     if art:
         embed.set_image(url=art)
     if birthday:
-        embed.set_footer(text="🎂 Поздравительный трек")
+        embed.set_footer(text=t(gid, "np.birthday_footer"))
     return embed

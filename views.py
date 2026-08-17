@@ -15,6 +15,7 @@ from typing import Optional
 import core
 from core import *
 
+from i18n import t
 from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_reset_settings, db_save_settings, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
 from playback import connect_to_voice, search_with_node_fallback
@@ -22,6 +23,23 @@ from playback import connect_to_voice, search_with_node_fallback
 # ─────────────────────────────────────────────
 #  Голосование за скип
 # ─────────────────────────────────────────────
+BUTTON_LABELS = {
+    "Пауза": "btn.pause", "Играть": "btn.play", "Скип": "btn.skip",
+    "Повтор": "btn.loop", "Очередь": "btn.queue",
+    "В плейлист": "btn.to_playlist", "Стоп": "btn.stop",
+    "✅ За скип": "vote.yes_btn", "❌ Против": "vote.no_btn",
+    "🔢 К странице": "queue.jump_btn", "📑 Компактно": "queue.compact",
+}
+
+
+def localize_buttons(view, guild_id):
+    """Переводит подписи кнопок, заданных в декораторах (там нет guild)."""
+    for child in view.children:
+        key = BUTTON_LABELS.get(getattr(child, "label", None))
+        if key:
+            child.label = t(guild_id, key)
+
+
 class VoteSkipView(discord.ui.View):
     def __init__(self, guild: discord.Guild, channel: discord.TextChannel,
                  required_percent: int, initiator: discord.Member):
@@ -33,6 +51,7 @@ class VoteSkipView(discord.ui.View):
         self.votes_yes: set[int] = {initiator.id}
         self.votes_no: set[int] = set()
         self.message: Optional[discord.Message] = None
+        localize_buttons(self, guild.id)
         self.resolved = False
 
     def get_voter_count(self) -> int:
@@ -50,9 +69,7 @@ class VoteSkipView(discord.ui.View):
         total = self.get_voter_count()
         needed = max(1, int(total * self.required_percent / 100))
         return (
-            f"⏭ **Голосование за скип**\n"
-            f"✅ За: **{len(self.votes_yes)}** | ❌ Против: **{len(self.votes_no)}**\n"
-            f"Нужно **{needed}** из **{total}** голосов | Осталось 30 сек"
+            t(self.guild.id, "vote.prompt", p0=len(self.votes_yes), p1=len(self.votes_no), p2=needed, p3=total)
         )
 
     @discord.ui.button(label="✅ За скип", style=discord.ButtonStyle.success)
@@ -60,7 +77,7 @@ class VoteSkipView(discord.ui.View):
         player: wavelink.Player = self.guild.voice_client
         if not player or not player.channel or interaction.user not in player.channel.members:
             await interaction.response.send_message(
-                "❗ Войди в голосовой канал чтобы голосовать.", ephemeral=True
+                t(interaction.guild_id, "vote.join_first"), ephemeral=True
             )
             return
         self.votes_yes.add(interaction.user.id)
@@ -74,7 +91,7 @@ class VoteSkipView(discord.ui.View):
         player: wavelink.Player = self.guild.voice_client
         if not player or not player.channel or interaction.user not in player.channel.members:
             await interaction.response.send_message(
-                "❗ Войди в голосовой канал чтобы голосовать.", ephemeral=True
+                t(interaction.guild_id, "vote.join_first"), ephemeral=True
             )
             return
         self.votes_no.add(interaction.user.id)
@@ -97,7 +114,7 @@ class VoteSkipView(discord.ui.View):
                 log.warning("Skip error: %s", e)
         if self.message:
             try:
-                await self.message.edit(content="✅ Голосование прошло — трек пропущен!", view=None)
+                await self.message.edit(content=t(self.guild.id, "vote.passed"), view=None)
             except discord.HTTPException:
                 pass
 
@@ -109,8 +126,7 @@ class VoteSkipView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(
-                    content=f"❌ Голосование завершилось — недостаточно голосов "
-                            f"({len(self.votes_yes)} за, нужно было больше).",
+                    content=t(self.guild.id, "vote.failed", p0=len(self.votes_yes)),
                     view=None
                 )
             except discord.HTTPException:
@@ -120,10 +136,10 @@ class VoteSkipView(discord.ui.View):
 # ─────────────────────────────────────────────
 #  Пагинация очереди
 # ─────────────────────────────────────────────
-class JumpToPageModal(discord.ui.Modal, title="Перейти к странице"):
+class JumpToPageModal(discord.ui.Modal, title="Go to page"):
     page_input = discord.ui.TextInput(
-        label="Номер страницы",
-        placeholder="Введи число",
+        label="Page number",
+        placeholder="Enter a number",
         required=True,
         max_length=4,
     )
@@ -131,17 +147,21 @@ class JumpToPageModal(discord.ui.Modal, title="Перейти к страниц�
     def __init__(self, view: "QueuePaginationView"):
         super().__init__()
         self.view_ref = view
+        gid = getattr(getattr(view, "guild", None), "id", None)
+        self.title = t(gid, "jump.title")
+        self.page_input.label = t(gid, "jump.label")
+        self.page_input.placeholder = t(gid, "jump.placeholder")
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             target = int((self.page_input.value or "").strip())
         except ValueError:
-            await interaction.response.send_message("❗ Введи число.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "jump.need_number"), ephemeral=True)
             return
         total_pages = self.view_ref.total_pages()
         if target < 1 or target > total_pages:
             await interaction.response.send_message(
-                f"❗ Номер от 1 до {total_pages}.", ephemeral=True
+                t(interaction.guild_id, "jump.range", p0=total_pages), ephemeral=True
             )
             return
         self.view_ref.current_page = target - 1
@@ -159,6 +179,7 @@ class QueuePaginationView(discord.ui.View):
         self.current_page = 0
         self.compact = False
         self.message: Optional[discord.Message] = None
+        localize_buttons(self, guild.id)
 
     async def on_error(self, interaction: discord.Interaction,
                        error: Exception, item: discord.ui.Item):
@@ -194,19 +215,19 @@ class QueuePaginationView(discord.ui.View):
         self.current_page = max(0, min(self.current_page, total_pages - 1))
 
         embed = discord.Embed(color=BRAND_COLOR)
-        embed.set_author(name="📜 Очередь")
+        embed.set_author(name=t(self.guild.id, "queue.title"))
 
         if p and p.current:
-            t = p.current
-            cur = f"[{t.title}]({t.uri})" if t.uri else t.title
+            tr = p.current
+            cur = f"[{tr.title}]({tr.uri})" if tr.uri else tr.title
             embed.add_field(
-                name="🎵 Сейчас",
+                name=t(self.guild.id, "queue.now"),
                 value=f"**{cur}** `[{format_duration(t.length)}]`",
                 inline=False,
             )
 
         if not snapshot:
-            embed.description = "📭 Очередь пуста."
+            embed.description = t(self.guild.id, "queue.empty")
             self._update_buttons(total_pages)
             return embed
 
@@ -215,16 +236,16 @@ class QueuePaginationView(discord.ui.View):
         shown = snapshot[start:end]
 
         lines = []
-        for i, t in enumerate(shown, start=start + 1):
+        for i, tr in enumerate(shown, start=start + 1):
             if self.compact:
-                title = t.title if len(t.title) <= 58 else t.title[:57] + "…"
+                title = tr.title if len(tr.title) <= 58 else tr.title[:57] + "…"
                 lines.append(f"`{i}.` {title}")
             else:
-                link = f" — [открыть]({t.uri})" if t.uri else ""
-                lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`{link}")
+                link = t(self.guild.id, "queue.open", p0=tr.uri) if tr.uri else ""
+                lines.append(f"`{i}.` {tr.title} `[{format_duration(tr.length)}]`{link}")
         embed.description = "\n".join(lines)
         embed.set_footer(
-            text=f"{len(snapshot)} треков · страница {self.current_page + 1}/{total_pages}")
+            text=t(self.guild.id, "queue.footer", p0=len(snapshot), p1=self.current_page + 1, p2=total_pages))
 
         self._update_buttons(total_pages)
         return embed
@@ -235,7 +256,7 @@ class QueuePaginationView(discord.ui.View):
         self.next_btn.disabled = self.current_page >= total_pages - 1
         self.last_btn.disabled = self.current_page >= total_pages - 1
         self.jump_btn.disabled = total_pages <= 1
-        self.compact_btn.label = "📋 Подробно" if self.compact else "📑 Компактно"
+        self.compact_btn.label = t(self.guild.id, "queue.detailed") if self.compact else t(self.guild.id, "queue.compact")
 
     async def on_timeout(self):
         if self.message:
@@ -278,10 +299,10 @@ class QueuePaginationView(discord.ui.View):
 # ─────────────────────────────────────────────
 #  Модалка добавления в плейлист
 # ─────────────────────────────────────────────
-class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейлист"):
+class AddToPlaylistModal(discord.ui.Modal, title="Add to playlist"):
     playlist_name = discord.ui.TextInput(
-        label="Название плейлиста",
-        placeholder="Введи название плейлиста",
+        label="Playlist name",
+        placeholder="Enter a playlist name",
         required=True,
         max_length=PLAYLIST_NAME_MAX,
     )
@@ -289,18 +310,23 @@ class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейл
     def __init__(self, guild: discord.Guild):
         super().__init__()
         self.guild = guild
+        # подписи модалки задаются на уровне класса, где ещё нет guild —
+        # поэтому переводим здесь, при создании
+        self.title = t(guild.id, "addpl.modal_title")
+        self.playlist_name.label = t(guild.id, "addpl.name_label")
+        self.playlist_name.placeholder = t(guild.id, "addpl.name_ph")
 
     async def on_submit(self, interaction: discord.Interaction):
         player: wavelink.Player = self.guild.voice_client
         if not player or not player.current:
-            await interaction.response.send_message("❗ Ничего не играет.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.nothing_playing"), ephemeral=True)
             return
         if not core.db_pool:
-            await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.no_db"), ephemeral=True)
             return
         name = (self.playlist_name.value or "").strip()
         if not name:
-            await interaction.response.send_message("❗ Название не может быть пустым.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.name_empty"), ephemeral=True)
             return
         playlist = await db_get_playlist(interaction.user.id, name)
         if playlist:
@@ -308,12 +334,12 @@ class AddToPlaylistModal(discord.ui.Modal, title="Добавить в плейл
         else:
             pid = await db_create_playlist(interaction.user.id, name)
             if pid is None:
-                await interaction.response.send_message("❗ Не удалось создать плейлист.", ephemeral=True)
+                await interaction.response.send_message(t(interaction.guild_id, "addpl.create_failed"), ephemeral=True)
                 return
         track = player.current
         await db_add_track(pid, track.title, track.uri or "", track.length)
         await interaction.response.send_message(
-            f"✅ **{track.title}** добавлен в **{name}**!", ephemeral=True
+            t(interaction.guild_id, "addpl.added_named", p0=track.title, p1=name), ephemeral=True
         )
 
 
@@ -327,17 +353,17 @@ class AddToPlaylistView(discord.ui.View):
             options.append(discord.SelectOption(
                 label=p["name"][:100],
                 value=str(p["id"]),
-                description=f"{p['track_count']} треков"[:100],
+                description=t(guild.id, "addpl.count", p0=p['track_count'])[:100],
             ))
         options.append(discord.SelectOption(
-            label="Создать новый плейлист", value="__new__", emoji="➕"))
-        sel = discord.ui.Select(placeholder="Выбери плейлист…", options=options)
+            label=t(guild.id, "addpl.create_new"), value="__new__", emoji="➕"))
+        sel = discord.ui.Select(placeholder=t(guild.id, "addpl.pick"), options=options)
         sel.callback = self._on_select
         self.add_item(sel)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❗ Это не твоё меню.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.not_your_menu"), ephemeral=True)
             return False
         return True
 
@@ -348,12 +374,12 @@ class AddToPlaylistView(discord.ui.View):
             return
         player = self.guild.voice_client
         if not player or not player.current:
-            await interaction.response.edit_message(content="❗ Ничего не играет.", view=None)
+            await interaction.response.edit_message(content=t(interaction.guild_id, "err.nothing_playing"), view=None)
             return
         track = player.current
         await db_add_track(int(val), track.title, track.uri or "", track.length)
         await interaction.response.edit_message(
-            content=f"✅ **{track.title}** добавлен в плейлист!", view=None)
+            content=t(interaction.guild_id, "addpl.added", p0=track.title), view=None)
 
 
 # ─────────────────────────────────────────────
@@ -363,6 +389,7 @@ class PlayerControls(discord.ui.View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=None)
         self.guild = guild
+        localize_buttons(self, guild.id)
 
     async def on_error(self, interaction: discord.Interaction,
                        error: Exception, item: discord.ui.Item):
@@ -374,7 +401,7 @@ class PlayerControls(discord.ui.View):
         try:
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "❗ Ошибка кнопки. Попробуй позже.", ephemeral=True
+                    t(interaction.guild_id, "btn.error"), ephemeral=True
                 )
         except discord.HTTPException:
             pass
@@ -386,18 +413,18 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(emoji="⏸", style=discord.ButtonStyle.secondary, row=0, label="Пауза")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         p = self.player
         if p and p.playing and not p.paused:
             await p.pause(True)
             button.emoji = "▶️"
-            button.label = "Играть"
+            button.label = t(interaction.guild_id, "btn.play")
             await interaction.response.edit_message(view=self)
         elif p and p.paused:
             await p.pause(False)
             button.emoji = "⏸"
-            button.label = "Пауза"
+            button.label = t(interaction.guild_id, "btn.pause")
             await interaction.response.edit_message(view=self)
         else:
             await interaction.response.defer()
@@ -418,7 +445,7 @@ class PlayerControls(discord.ui.View):
                 )
                 return
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         if p.queue.mode == wavelink.QueueMode.loop:
             p.queue.mode = wavelink.QueueMode.normal
@@ -428,7 +455,7 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0, label="Повтор")
     async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         p = self.player
         if not p:
@@ -436,9 +463,9 @@ class PlayerControls(discord.ui.View):
             return
         modes = [wavelink.QueueMode.normal, wavelink.QueueMode.loop, wavelink.QueueMode.loop_all]
         labels = {
-            wavelink.QueueMode.normal:   "Повтор выкл ➡️",
-            wavelink.QueueMode.loop:     "Повтор трека 🔂",
-            wavelink.QueueMode.loop_all: "Повтор очереди 🔁",
+            wavelink.QueueMode.normal:   t(interaction.guild_id, "btn.loop_off"),
+            wavelink.QueueMode.loop:     t(interaction.guild_id, "btn.loop_track"),
+            wavelink.QueueMode.loop_all: t(interaction.guild_id, "btn.loop_queue"),
         }
         current = p.queue.mode
         next_mode = modes[(modes.index(current) + 1) % 3]
@@ -448,20 +475,20 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0, label="Shuffle")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         p = self.player
         if p and len(p.queue) > 1:
             p.queue.shuffle()
-            await interaction.response.send_message("🔀 Очередь перемешана.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "ctl.shuffled"), ephemeral=True)
         else:
-            await interaction.response.send_message("❗ Нечего перемешивать.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.nothing_to_shuffle"), ephemeral=True)
 
     @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, row=0, label="Очередь")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         p = self.player
         if not p or (not p.current and p.queue.is_empty):
-            await interaction.response.send_message("📭 Очередь пуста.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "queue.empty"), ephemeral=True)
             return
         view = QueuePaginationView(self.guild, interaction.user.id)
         await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
@@ -473,7 +500,7 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1, label="-10%")
     async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         p = self.player
         if not p:
@@ -481,12 +508,12 @@ class PlayerControls(discord.ui.View):
             return
         new_vol = max(0, p.volume - 10)
         await p.set_volume(new_vol)
-        await interaction.response.send_message(f"🔉 Громкость: **{new_vol}%**", ephemeral=True)
+        await interaction.response.send_message(t(interaction.guild_id, "btn.vol_down", p0=new_vol), ephemeral=True)
 
     @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1, label="+10%")
     async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         p = self.player
         if not p:
@@ -494,31 +521,31 @@ class PlayerControls(discord.ui.View):
             return
         new_vol = min(100, p.volume + 10)
         await p.set_volume(new_vol)
-        await interaction.response.send_message(f"🔊 Громкость: **{new_vol}%**", ephemeral=True)
+        await interaction.response.send_message(t(interaction.guild_id, "btn.vol_up", p0=new_vol), ephemeral=True)
 
     @discord.ui.button(emoji="💾", style=discord.ButtonStyle.secondary, row=1, label="В плейлист")
     async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         player: wavelink.Player = self.guild.voice_client
         if not player or not player.current:
-            await interaction.response.send_message("❗ Ничего не играет.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.nothing_playing"), ephemeral=True)
             return
         if not core.db_pool:
-            await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "err.no_db"), ephemeral=True)
             return
         playlists = await db_get_user_playlists(interaction.user.id)
         if not playlists:
             await interaction.response.send_modal(AddToPlaylistModal(self.guild))
             return
         view = AddToPlaylistView(self.guild, interaction.user.id, playlists)
-        await interaction.response.send_message("💾 Выбери плейлист:", view=view, ephemeral=True)
+        await interaction.response.send_message(t(interaction.guild_id, "btn.pick_playlist"), view=view, ephemeral=True)
 
     @discord.ui.button(emoji="⏹", style=discord.ButtonStyle.danger, row=1, label="Стоп")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await is_dj(interaction.user):
-            await interaction.response.send_message("❗ Нужна роль DJ.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "btn.dj_required"), ephemeral=True)
             return
         await full_disconnect(self.guild)
-        await interaction.response.send_message("⏹ Остановлено.", ephemeral=True)
+        await interaction.response.send_message(t(interaction.guild_id, "ctl.stopped"), ephemeral=True)
 
 
 async def start_vote_skip(member: discord.Member, guild: discord.Guild,
@@ -570,7 +597,7 @@ class TrackSelectView(discord.ui.View):
             btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.primary)
             btn.callback = self._make_cb(i)
             self.add_item(btn)
-        cancel = discord.ui.Button(label="✖ Отмена", style=discord.ButtonStyle.danger)
+        cancel = discord.ui.Button(label=t(guild.id, "sel.cancel"), style=discord.ButtonStyle.danger)
         cancel.callback = self._cancel
         self.add_item(cancel)
 
@@ -584,7 +611,7 @@ class TrackSelectView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
-                "❗ Это меню выбора не для тебя.", ephemeral=True
+                t(interaction.guild_id, "sel.not_yours"), ephemeral=True
             )
             return False
         return True
@@ -600,9 +627,7 @@ class TrackSelectView(discord.ui.View):
                     if player is None:
                         try:
                             await self.search_msg.edit(
-                                content="❗ Не удалось подключиться к голосовому каналу.\n"
-                                        "_Lavalink-ноды могут быть недоступны или Discord "
-                                        "не отвечает. Попробуй ещё раз через минуту._",
+                                content=t(interaction.guild_id, "sel.connect_failed"),
                                 view=None,
                             )
                         except discord.HTTPException:
@@ -614,7 +639,7 @@ class TrackSelectView(discord.ui.View):
             except Exception as e:
                 log.warning("Voice connect error: %s", e)
                 try:
-                    await self.search_msg.edit(content=f"❗ Не удалось подключиться: {e}", view=None)
+                    await self.search_msg.edit(content=t(interaction.guild_id, "sel.connect_error", p0=e), view=None)
                 except discord.HTTPException:
                     pass
                 self.stop()
@@ -635,7 +660,7 @@ class TrackSelectView(discord.ui.View):
                 increment_user_track_count(self.guild.id, self.user_id)
                 try:
                     await self.search_msg.edit(
-                        content=f"➕ **Добавлено:** {track.title} `[{format_duration(track.length)}]`",
+                        content=t(interaction.guild_id, "play.added", p0=track.title, p1=format_duration(track.length)),
                         view=None,
                     )
                 except discord.HTTPException:
@@ -647,14 +672,14 @@ class TrackSelectView(discord.ui.View):
     async def _cancel(self, interaction: discord.Interaction):
         await interaction.response.defer()
         try:
-            await self.search_msg.edit(content="❌ Отменено.", view=None)
+            await self.search_msg.edit(content=t(interaction.guild_id, "sel.cancelled"), view=None)
         except discord.HTTPException:
             pass
         self.stop()
 
     async def on_timeout(self):
         try:
-            await self.search_msg.edit(content="⏱ Время вышло.", view=None)
+            await self.search_msg.edit(content=t(self.guild.id, "sel.timeout"), view=None)
         except discord.HTTPException:
             pass
 
@@ -662,8 +687,10 @@ class TrackSelectView(discord.ui.View):
 class PlaylistEditView(discord.ui.View):
     PER_PAGE = 25
 
-    def __init__(self, owner_id, playlist_id, playlist_name, tracks, message=None):
+    def __init__(self, owner_id, playlist_id, playlist_name, tracks, message=None,
+                 guild_id=None):
         super().__init__(timeout=180)
+        self.guild_id = guild_id
         self.owner_id = owner_id
         self.playlist_id = playlist_id
         self.playlist_name = playlist_name
@@ -684,14 +711,14 @@ class PlaylistEditView(discord.ui.View):
         start = self.page * self.PER_PAGE
         page_tracks = self.tracks[start:start + self.PER_PAGE]
         options = []
-        for t in page_tracks:
+        for tr in page_tracks:
             options.append(discord.SelectOption(
-                label=(t["title"] or "—")[:100],
-                value=str(t["id"]),
-                description=f"#{t['position']} · {format_duration(t['duration'])}"[:100],
-                default=(t["id"] == self.selected_id),
+                label=(tr["title"] or "—")[:100],
+                value=str(tr["id"]),
+                description=f"#{tr['position']} · {format_duration(tr['duration'])}"[:100],
+                default=(tr["id"] == self.selected_id),
             ))
-        sel = discord.ui.Select(placeholder="Выбери трек…", options=options, row=0)
+        sel = discord.ui.Select(placeholder=t(self.guild_id, "edit.pick_track"), options=options, row=0)
         sel.callback = self._on_select
         self.add_item(sel)
         if self.pages > 1:
@@ -703,28 +730,28 @@ class PlaylistEditView(discord.ui.View):
                                     disabled=(self.page >= self.pages - 1), row=1)
             nxt.callback = self._next
             self.add_item(nxt)
-        dele = discord.ui.Button(label="🗑 Удалить", style=discord.ButtonStyle.danger,
+        dele = discord.ui.Button(label=t(self.guild_id, "edit.delete"), style=discord.ButtonStyle.danger,
                                  disabled=(self.selected_id is None), row=1)
         dele.callback = self._delete
         self.add_item(dele)
-        ver = discord.ui.Button(label="🔄 Сменить версию", style=discord.ButtonStyle.primary,
+        ver = discord.ui.Button(label=t(self.guild_id, "edit.change_version"), style=discord.ButtonStyle.primary,
                                 disabled=(self.selected_id is None), row=1)
         ver.callback = self._change_version
         self.add_item(ver)
 
     def _text(self):
-        head = f"✏️ **Редактор «{self.playlist_name}»** — {len(self.tracks)} треков"
+        head = t(self.guild_id, "edit.header", p0=self.playlist_name, p1=len(self.tracks))
         if self.pages > 1:
-            head += f"  ·  стр. {self.page + 1}/{self.pages}"
+            head += t(self.guild_id, "edit.page", p0=self.page + 1, p1=self.pages)
         if self.selected_id:
-            t = next((x for x in self.tracks if x["id"] == self.selected_id), None)
-            if t:
-                head += f"\n\nВыбран: **{t['title']}**"
+            tr = next((x for x in self.tracks if x["id"] == self.selected_id), None)
+            if tr:
+                head += t(self.guild_id, "edit.selected", p0=tr["title"])
         return head
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("❗ Это не твой редактор.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "edit.not_yours"), ephemeral=True)
             return False
         return True
 
@@ -755,7 +782,7 @@ class PlaylistEditView(discord.ui.View):
             self.page = self.pages - 1
         self._build()
         if not self.tracks:
-            await interaction.response.edit_message(content="📭 Плейлист теперь пуст.", view=None)
+            await interaction.response.edit_message(content=t(interaction.guild_id, "edit.now_empty"), view=None)
             self.stop()
             return
         await interaction.response.edit_message(content=self._text(), view=self)
@@ -763,8 +790,8 @@ class PlaylistEditView(discord.ui.View):
     async def _change_version(self, interaction):
         if self.selected_id is None:
             return
-        t = next((x for x in self.tracks if x["id"] == self.selected_id), None)
-        if not t:
+        tr = next((x for x in self.tracks if x["id"] == self.selected_id), None)
+        if not tr:
             return
         await interaction.response.defer()
         results, _ = await search_with_node_fallback(t["title"], wavelink.TrackSource.YouTube)
@@ -778,16 +805,16 @@ class PlaylistEditView(discord.ui.View):
         else:
             cand = []
         if not cand:
-            await interaction.followup.send("😕 Не нашёл вариантов для замены.", ephemeral=True)
+            await interaction.followup.send(t(interaction.guild_id, "edit.no_versions"), ephemeral=True)
             return
         vview = VersionSelectView(self, t, cand)
         await interaction.edit_original_response(
-            content=f"🔄 Выбери версию для **{t['title']}**:", view=vview)
+            content=t(interaction.guild_id, "edit.pick_version", p0=tr['title']), view=vview)
 
     async def on_timeout(self):
         if self.message:
             try:
-                await self.message.edit(content="⏱ Редактор закрыт.", view=None)
+                await self.message.edit(content=t(self.guild_id, "edit.closed"), view=None)
             except discord.HTTPException:
                 pass
 
@@ -805,16 +832,16 @@ class VersionSelectView(discord.ui.View):
                 value=str(i),
                 description=format_duration(c.length)[:100],
             ))
-        sel = discord.ui.Select(placeholder="Выбери нужную версию…", options=options, row=0)
+        sel = discord.ui.Select(placeholder=t(self.editor.guild_id, "ver.pick"), options=options, row=0)
         sel.callback = self._on_pick
         self.add_item(sel)
-        cancel = discord.ui.Button(label="Отмена", style=discord.ButtonStyle.secondary, row=1)
+        cancel = discord.ui.Button(label=t(self.editor.guild_id, "ver.cancel"), style=discord.ButtonStyle.secondary, row=1)
         cancel.callback = self._cancel
         self.add_item(cancel)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.editor.owner_id:
-            await interaction.response.send_message("❗ Это не твой редактор.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "edit.not_yours"), ephemeral=True)
             return False
         return True
 
@@ -826,7 +853,7 @@ class VersionSelectView(discord.ui.View):
         self.editor.selected_id = None
         self.editor._build()
         await interaction.response.edit_message(
-            content=self.editor._text() + f"\n\n✅ Версия обновлена: **{c.title}**",
+            content=self.editor._text() + t(interaction.guild_id, "edit.version_updated", p0=c.title),
             view=self.editor)
 
     async def _cancel(self, interaction):
@@ -835,27 +862,27 @@ class VersionSelectView(discord.ui.View):
 
 
 PANEL_TOGGLES = {
-    "vote_skip_enabled": "Голосование за скип",
-    "fair_queue": "Справедливая очередь",
-    "announce_now_playing": "Объявлять «сейчас играет»",
+    "vote_skip_enabled": "panel.o_voteskip",
+    "fair_queue": "panel.o_fair",
+    "announce_now_playing": "panel.o_announce",
 }
 PANEL_NUMBERS = {
-    "default_volume": ("Громкость по умолчанию (%)", 1, 100),
-    "vote_skip_percent": ("Порог голосования (%)", 1, 100),
-    "track_limit": ("Лимит треков (0 = без лимита)", 0, 50),
-    "idle_timeout": ("Таймаут бездействия (сек)", 60, 3600),
-    "empty_timeout": ("Таймаут пустого канала (сек)", 10, 3600),
+    "default_volume": ("panel.o_volume", 1, 100),
+    "vote_skip_percent": ("panel.o_threshold", 1, 100),
+    "track_limit": ("panel.o_limit", 0, 50),
+    "idle_timeout": ("panel.o_idle", 60, 3600),
+    "empty_timeout": ("panel.o_empty", 10, 3600),
 }
 PANEL_CHOICES = {
     "language": (
-        "Язык бота / Bot language",
+        "panel.o_language",
         ["ru", "en"],
         {"ru": "Русский", "en": "English"},
     ),
     "default_search_source": (
-        "Источник поиска по умолчанию",
+        "panel.o_source",
         ["youtube", "yandex", "soundcloud"],
-        {"youtube": "YouTube", "yandex": "Яндекс.Музыка", "soundcloud": "SoundCloud"},
+        {"youtube": "YouTube", "yandex": "Yandex Music", "soundcloud": "SoundCloud"},
     ),
 }
 PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source", "language"]
@@ -864,20 +891,21 @@ PANEL_ADVANCED = ["vote_skip_percent", "track_limit", "idle_timeout", "empty_tim
 
 class SettingValueModal(discord.ui.Modal):
     def __init__(self, panel, key):
-        label, lo, hi = PANEL_NUMBERS[key]
+        label_key, lo, hi = PANEL_NUMBERS[key]
+        label = t(panel.guild.id, label_key)
         super().__init__(title=label[:45])
         self.panel = panel
         self.key = key
         self.lo, self.hi = lo, hi
         self.field = discord.ui.TextInput(
-            label=f"Число от {lo} до {hi}", required=True, max_length=6)
+            label=t(self.guild.id, "panel.number_range", p0=lo, p1=hi), required=True, max_length=6)
         self.add_item(self.field)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             v = int(self.field.value)
         except ValueError:
-            await interaction.response.send_message("❗ Нужно целое число.", ephemeral=True)
+            await interaction.response.send_message(t(interaction.guild_id, "panel.need_int"), ephemeral=True)
             return
         v = max(self.lo, min(v, self.hi))
         await db_save_settings(self.panel.guild.id, **{self.key: v})
@@ -894,7 +922,7 @@ class SettingsPanelView(discord.ui.View):
 
     def _build(self):
         self.clear_items()
-        rs = discord.ui.RoleSelect(placeholder="🎧 Выбрать DJ-роль…",
+        rs = discord.ui.RoleSelect(placeholder=t(self.guild.id, "panel.pick_dj"),
                                    min_values=0, max_values=1, row=0)
         rs.callback = self._on_role
         self.add_item(rs)
@@ -905,71 +933,71 @@ class SettingsPanelView(discord.ui.View):
             if k in PANEL_TOGGLES:
                 val = self.settings.get(k, False)
                 options.append(discord.SelectOption(
-                    label=PANEL_TOGGLES[k], value=k,
-                    description="Сейчас: включено" if val else "Сейчас: выключено"))
+                    label=t(self.guild.id, PANEL_TOGGLES[k]), value=k,
+                    description=t(self.guild.id, "panel.now_on") if val else t(self.guild.id, "panel.now_off")))
             elif k in PANEL_NUMBERS:
-                label, lo, hi = PANEL_NUMBERS[k]
+                label_key, lo, hi = PANEL_NUMBERS[k]
                 options.append(discord.SelectOption(
-                    label=label, value=k,
-                    description=f"Сейчас: {self.settings.get(k, lo)}"))
+                    label=t(self.guild.id, label_key), value=k,
+                    description=t(self.guild.id, "panel.now_value", p0=self.settings.get(k, lo))))
             else:
-                label, opts, labels = PANEL_CHOICES[k]
+                label_key, opts, labels = PANEL_CHOICES[k]
                 cur = self.settings.get(k, opts[0])
                 options.append(discord.SelectOption(
-                    label=label, value=k,
-                    description=f"Сейчас: {labels.get(cur, cur)}"))
-        sel = discord.ui.Select(placeholder="Изменить настройку…", options=options, row=1)
+                    label=t(self.guild.id, label_key), value=k,
+                    description=t(self.guild.id, "panel.now_value", p0=labels.get(cur, cur))))
+        sel = discord.ui.Select(placeholder=t(self.guild.id, "panel.change"), options=options, row=1)
         sel.callback = self._on_setting
         self.add_item(sel)
 
         btn = discord.ui.Button(
-            label="⚙️ Свернуть" if self.show_all else "⚙️ Все настройки",
+            label=t(self.guild.id, "panel.collapse") if self.show_all else t(self.guild.id, "panel.expand"),
             style=discord.ButtonStyle.secondary, row=2)
         btn.callback = self._toggle_all
         self.add_item(btn)
-        reset = discord.ui.Button(label="Сбросить DJ-роль",
+        reset = discord.ui.Button(label=t(self.guild.id, "panel.reset_dj"),
                                   style=discord.ButtonStyle.secondary, row=2)
         reset.callback = self._reset_dj
         self.add_item(reset)
-        reset_all = discord.ui.Button(label="♻️ Сбросить всё",
+        reset_all = discord.ui.Button(label=t(self.guild.id, "panel.reset_all"),
                                       style=discord.ButtonStyle.danger, row=2)
         reset_all.callback = self._reset_all
         self.add_item(reset_all)
 
     def build_embed(self):
         s = self.settings
-        dj = f"<@&{s.get('dj_role_id')}>" if s.get("dj_role_id") else "не задана"
-        vs = (f"включено · порог {s.get('vote_skip_percent', 50)}%"
-              if s.get("vote_skip_enabled") else "выключено")
+        dj = f"<@&{s.get('dj_role_id')}>" if s.get("dj_role_id") else t(self.guild.id, "panel.not_set")
+        vs = (t(self.guild.id, "panel.on_threshold", p0=s.get('vote_skip_percent', 50))
+              if s.get("vote_skip_enabled") else t(self.guild.id, "panel.off"))
         tl = s.get("track_limit", 0)
         embed = discord.Embed(
-            title="⚙️ Настройки сервера",
-            description="Меняй настройки через меню и кнопки ниже.",
+            title=t(self.guild.id, "panel.title"),
+            description=t(self.guild.id, "panel.desc"),
             color=BRAND_COLOR)
-        embed.add_field(name="🎧 DJ-роль", value=dj, inline=True)
-        embed.add_field(name="⏭ Голосование за скип", value=vs, inline=True)
-        embed.add_field(name="⚖️ Справедливая очередь",
-                        value="включена" if s.get("fair_queue") else "выключена", inline=True)
-        embed.add_field(name="📢 Объявлять «сейчас играет»",
-                        value="да" if s.get("announce_now_playing", True) else "нет", inline=True)
-        embed.add_field(name="📏 Лимит треков на человека",
-                        value="без лимита" if not tl else str(tl), inline=True)
-        embed.add_field(name="🔊 Громкость по умолчанию",
+        embed.add_field(name=t(self.guild.id, "panel.f_dj"), value=dj, inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_voteskip"), value=vs, inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_fair"),
+                        value=t(self.guild.id, "panel.on_f") if s.get("fair_queue") else t(self.guild.id, "panel.off_f"), inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_announce"),
+                        value=t(self.guild.id, "panel.yes") if s.get("announce_now_playing", True) else t(self.guild.id, "panel.no"), inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_limit"),
+                        value=t(self.guild.id, "panel.no_limit") if not tl else str(tl), inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_volume"),
                         value=f"{s.get('default_volume', 100)}%", inline=True)
-        embed.add_field(name="⏲ Таймаут бездействия",
-                        value=f"{s.get('idle_timeout', 300)} сек", inline=True)
-        embed.add_field(name="🚪 Таймаут пустого канала",
-                        value=f"{s.get('empty_timeout', 60)} сек", inline=True)
-        _src = {"youtube": "YouTube", "yandex": "Яндекс", "soundcloud": "SoundCloud"}
-        embed.add_field(name="🔍 Источник поиска",
+        embed.add_field(name=t(self.guild.id, "panel.f_idle"),
+                        value=t(self.guild.id, "panel.seconds", p0=s.get('idle_timeout', 300)), inline=True)
+        embed.add_field(name=t(self.guild.id, "panel.f_empty"),
+                        value=t(self.guild.id, "panel.seconds", p0=s.get('empty_timeout', 60)), inline=True)
+        _src = {"youtube": "YouTube", "yandex": t(self.guild.id, "panel.yandex"), "soundcloud": "SoundCloud"}
+        embed.add_field(name=t(self.guild.id, "panel.f_source"),
                         value=_src.get(s.get("default_search_source", "youtube"), "YouTube"), inline=True)
-        embed.set_footer(text="Доступно админам сервера")
+        embed.set_footer(text=t(self.guild.id, "panel.footer"))
         return embed
 
     async def interaction_check(self, interaction):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message(
-                "❗ Нужно право «Управление сервером».", ephemeral=True)
+                t(interaction.guild_id, "panel.need_perm"), ephemeral=True)
             return False
         return True
 
@@ -1002,12 +1030,12 @@ class SettingsPanelView(discord.ui.View):
         elif key in PANEL_NUMBERS:
             await interaction.response.send_modal(SettingValueModal(self, key))
         else:
-            label, opts, labels = PANEL_CHOICES[key]
+            label_key, opts, labels = PANEL_CHOICES[key]
+            label = t(self.guild.id, label_key)
             cur = self.settings.get(key, opts[0])
             options = [
-                discord.SelectOption(
-                    label=labels.get(o, o), value=o,
-                    default=(o == cur))
+                discord.SelectOption(label=labels.get(o, o), value=o,
+                                     default=(o == cur))
                 for o in opts
             ]
             sel = discord.ui.Select(placeholder=label[:100], options=options)
@@ -1023,7 +1051,8 @@ class SettingsPanelView(discord.ui.View):
             sel.callback = _pick
             picker = discord.ui.View(timeout=60)
             picker.add_item(sel)
-            back = discord.ui.Button(label="↩️ Назад", style=discord.ButtonStyle.secondary)
+            back = discord.ui.Button(label=t(self.guild.id, "panel.back"),
+                                     style=discord.ButtonStyle.secondary)
 
             async def _back(inner):
                 self._build()
@@ -1033,14 +1062,14 @@ class SettingsPanelView(discord.ui.View):
             picker.add_item(back)
             embed = discord.Embed(
                 title=f"⚙️ {label}",
-                description="Выбери значение в меню ниже. / Pick a value below.",
+                description=t(self.guild.id, "panel.pick_value"),
                 color=BRAND_COLOR)
             await interaction.response.edit_message(embed=embed, view=picker)
 
     async def _reset_all(self, interaction):
         embed = discord.Embed(
-            title="♻️ Сбросить все настройки?",
-            description="Все настройки сервера вернутся к значениям по умолчанию.\nЭто действие нельзя отменить.",
+            title=t(interaction.guild_id, "panel.reset_confirm"),
+            description=t(interaction.guild_id, "panel.reset_desc"),
             color=BRAND_COLOR)
         await interaction.response.edit_message(embed=embed, view=ResetConfirmView(self))
 

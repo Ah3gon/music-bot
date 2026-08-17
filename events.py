@@ -15,6 +15,7 @@ import core
 from core import *
 
 from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
+from i18n import t
 from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
@@ -136,10 +137,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                       max_skip_attempts)
             if channel:
                 try:
-                    await channel.send(
-                        "⚠️ Lavalink-нода вернулась с ошибкой.\n"
-                        "_Попробуй `/play <трек>` чтобы перезапустить плеер._"
-                    )
+                    await channel.send(t(guild.id, "evt.node_error"))
                 except discord.HTTPException:
                     pass
                 await start_idle_timer(guild, channel)
@@ -247,8 +245,8 @@ async def _play_birthday_now(member: discord.Member,
             if text_channel:
                 try:
                     await text_channel.send(
-                        f"🎂 С Днём рождения, {member.mention}! "
-                        f"🎉 {BOT_NAME} поздравляет тебя!"
+                        t(member.guild.id, "bday.greeting",
+                          mention=member.mention, bot=BOT_NAME)
                     )
                 except discord.HTTPException:
                     pass
@@ -297,8 +295,8 @@ async def _play_birthday_now(member: discord.Member,
             await player.queue.put_wait(bday_track)
             if resume_track:
                 await player.queue.put_wait(resume_track)
-            for t in current_queue:
-                await player.queue.put_wait(t)
+            for tr in current_queue:
+                await player.queue.put_wait(tr)
 
         state["birthday_prev_mode"] = prev_mode
         await player.skip(force=True)
@@ -306,8 +304,8 @@ async def _play_birthday_now(member: discord.Member,
         if text_channel:
             try:
                 await text_channel.send(
-                    f"🎂 С Днём рождения, {member.mention}! "
-                    f"🎉 {BOT_NAME} прерывает музыку ради поздравления!"
+                    t(member.guild.id, "bday.interrupt",
+                      mention=member.mention, bot=BOT_NAME)
                 )
             except discord.HTTPException:
                 pass
@@ -386,7 +384,7 @@ async def on_voice_state_update(member: discord.Member,
             ch = guild.get_channel(channel_id)
             if ch:
                 try:
-                    await ch.send("👋 Все ушли — выхожу из канала.")
+                    await ch.send(t(guild.id, "evt.all_left"))
                 except discord.HTTPException:
                     pass
         empty_channel_tasks.pop(guild.id, None)

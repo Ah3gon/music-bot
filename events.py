@@ -15,7 +15,6 @@ import core
 from core import *
 
 from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
-from i18n import t
 from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
 from playback import connect_to_voice, safe_play_track, search_with_node_fallback
 from views import PlayerControls
@@ -34,6 +33,7 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     guild = player.guild
     cancel_idle_timer(guild.id)
     state = get_player_state(guild.id)
+    state["consec_fails"] = 0
 
     is_birthday_track = state.get("birthday_playing", False)
 
@@ -120,6 +120,22 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         except Exception:
             pass
 
+    if state.get("consec_fails", 0) >= 4 and not player.queue.is_empty:
+        dropped = len(player.queue)
+        player.queue.clear()
+        state["consec_fails"] = 0
+        log.warning("Предохранитель: 4 трека подряд не запустились, очередь (%d) очищена", dropped)
+        if channel:
+            try:
+                await channel.send(
+                    f"⚠️ Несколько треков подряд не запустились — источник сейчас недоступен.\n"
+                    f"Очистил очередь ({dropped} шт.), попробуй позже или другой источник."
+                )
+            except discord.HTTPException:
+                pass
+            await start_idle_timer(guild, channel)
+        return
+
     if not player.queue.is_empty:
         # Пробуем запустить следующие треки. Если первый не запустился,
         # пробуем второй, третий и т.д. — на случай "битых" треков
@@ -137,7 +153,10 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
                       max_skip_attempts)
             if channel:
                 try:
-                    await channel.send(t(guild.id, "evt.node_error"))
+                    await channel.send(
+                        "⚠️ Lavalink-нода вернулась с ошибкой.\n"
+                        "_Попробуй `/play <трек>` чтобы перезапустить плеер._"
+                    )
                 except discord.HTTPException:
                     pass
                 await start_idle_timer(guild, channel)
@@ -174,16 +193,11 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     log.warning("Track exception: %s — '%s'",
                 getattr(payload, "exception", "?"),
                 track.title if track else "?")
-    # Wavelink сам должен вызвать track_end после exception, но на всякий случай
-    # пробуем запустить следующий
-    if player.queue.is_empty:
-        return
-    if player.playing:
-        return  # уже играет что-то
-    next_track = player.queue.get()
-    ok = await safe_play_track(player, next_track)
-    if not ok:
-        log.error("Не смог продолжить очередь после track exception")
+    state = get_player_state(player.guild.id)
+    state["consec_fails"] = state.get("consec_fails", 0) + 1
+    # Очередь продвигает track_end (Lavalink шлёт его следом за exception).
+    # Раньше здесь был второй запуск следующего трека — из-за этого при
+    # массовых ошибках треки "пытались играть одновременно".
 
 
 @bot.event
@@ -245,8 +259,8 @@ async def _play_birthday_now(member: discord.Member,
             if text_channel:
                 try:
                     await text_channel.send(
-                        t(member.guild.id, "bday.greeting",
-                          mention=member.mention, bot=BOT_NAME)
+                        f"🎂 С Днём рождения, {member.mention}! "
+                        f"🎉 {BOT_NAME} поздравляет тебя!"
                     )
                 except discord.HTTPException:
                     pass
@@ -295,8 +309,8 @@ async def _play_birthday_now(member: discord.Member,
             await player.queue.put_wait(bday_track)
             if resume_track:
                 await player.queue.put_wait(resume_track)
-            for tr in current_queue:
-                await player.queue.put_wait(tr)
+            for t in current_queue:
+                await player.queue.put_wait(t)
 
         state["birthday_prev_mode"] = prev_mode
         await player.skip(force=True)
@@ -304,8 +318,8 @@ async def _play_birthday_now(member: discord.Member,
         if text_channel:
             try:
                 await text_channel.send(
-                    t(member.guild.id, "bday.interrupt",
-                      mention=member.mention, bot=BOT_NAME)
+                    f"🎂 С Днём рождения, {member.mention}! "
+                    f"🎉 {BOT_NAME} прерывает музыку ради поздравления!"
                 )
             except discord.HTTPException:
                 pass
@@ -384,7 +398,7 @@ async def on_voice_state_update(member: discord.Member,
             ch = guild.get_channel(channel_id)
             if ch:
                 try:
-                    await ch.send(t(guild.id, "evt.all_left"))
+                    await ch.send("👋 Все ушли — выхожу из канала.")
                 except discord.HTTPException:
                     pass
         empty_channel_tasks.pop(guild.id, None)

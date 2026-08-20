@@ -251,14 +251,17 @@ async def ensure_voice_connection(
     return player
 
 
-async def search_many_youtube(queries: list, batch_size: int = 5) -> list:
-    """Ищет список запросов на YouTube пачками (параллельно), сохраняя порядок.
+async def search_many_youtube(queries: list, batch_size: int = 5, source=None) -> list:
+    """Ищет список запросов пачками (параллельно), сохраняя порядок.
+    source — источник поиска (по умолчанию YouTube).
     Возвращает список треков; None — если по запросу ничего не найдено."""
+    if source is None:
+        source = wavelink.TrackSource.YouTube
     found = []
 
     async def _one(q):
         try:
-            r, _ = await search_with_node_fallback(q, wavelink.TrackSource.YouTube)
+            r, _ = await search_with_node_fallback(q, source)
         except Exception:
             return None
         if not r:
@@ -274,3 +277,27 @@ async def search_many_youtube(queries: list, batch_size: int = 5) -> list:
         batch = queries[i:i + batch_size]
         found.extend(await asyncio.gather(*(_one(q) for q in batch)))
     return found
+
+
+async def find_alternative_track(title: str, author: str = ""):
+    """Ищет тот же трек на резервных источниках (SoundCloud, затем Яндекс).
+    Возвращает трек или None. Нужен, когда основной источник (YouTube) недоступен."""
+    query = f"{author} - {title}" if author else title
+    query = query.strip()
+    if not query:
+        return None
+    for src in (wavelink.TrackSource.SoundCloud, "ymsearch"):
+        try:
+            results, _ = await search_with_node_fallback(query, src)
+        except Exception:
+            continue
+        if not results:
+            continue
+        if isinstance(results, list):
+            if results:
+                return results[0]
+        else:
+            tracks = getattr(results, "tracks", None)
+            if tracks:
+                return tracks[0]
+    return None

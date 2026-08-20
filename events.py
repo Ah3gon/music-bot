@@ -15,8 +15,8 @@ import core
 from core import *
 
 from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
-from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer
-from playback import connect_to_voice, safe_play_track, search_with_node_fallback
+from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer, tag_track
+from playback import connect_to_voice, find_alternative_track, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
 # ─────────────────────────────────────────────
@@ -193,11 +193,41 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     log.warning("Track exception: %s — '%s'",
                 getattr(payload, "exception", "?"),
                 track.title if track else "?")
-    state = get_player_state(player.guild.id)
+    guild = player.guild
+    state = get_player_state(guild.id)
+
+    # Источник недоступен (частая беда с YouTube) — ищем тот же трек
+    # на резервных источниках и играем его вместо упавшего.
+    if track and not state.get("fallback_in_progress"):
+        state["fallback_in_progress"] = True
+        try:
+            alt = await find_alternative_track(track.title, getattr(track, "author", "") or "")
+        except Exception as e:
+            alt = None
+            log.warning("Поиск замены не удался: %s", e)
+        finally:
+            state["fallback_in_progress"] = False
+        if alt is not None:
+            log.info("Замена источника: '%s' → '%s'", track.title, alt.title)
+            owner = get_track_owner(guild.id, track)
+            if owner:
+                tag_track(guild.id, alt, owner)
+            state["consec_fails"] = 0
+            state["source_swapped"] = True
+            if await safe_play_track(player, alt):
+                channel_id = state.get("text_channel_id")
+                channel = guild.get_channel(channel_id) if channel_id else None
+                if channel:
+                    try:
+                        await channel.send(
+                            f"🔄 **{track.title}** недоступен на исходном источнике — играю найденную версию."
+                        )
+                    except discord.HTTPException:
+                        pass
+                return
+
     state["consec_fails"] = state.get("consec_fails", 0) + 1
     # Очередь продвигает track_end (Lavalink шлёт его следом за exception).
-    # Раньше здесь был второй запуск следующего трека — из-за этого при
-    # массовых ошибках треки "пытались играть одновременно".
 
 
 @bot.event

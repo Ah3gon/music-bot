@@ -19,7 +19,7 @@ from core import *
 
 from database import db_add_follow, db_add_server_track, db_add_track, db_create_playlist, db_create_server_playlist, db_delete_follow, db_delete_playlist, db_delete_server_playlist, db_get_birthday, db_get_follow, db_get_playlist, db_get_playlist_by_share_code, db_get_server_playlist, db_get_server_playlists, db_get_server_tracks, db_get_settings, db_get_tracks, db_get_user_follows, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
 from views import PlaylistEditView, SettingsPanelView
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 
@@ -389,9 +389,14 @@ async def pl_import(interaction: discord.Interaction, url: str, name: str):
         limited = spotify_tracks[:PLAYLIST_TRACK_LIMIT]
         await msg.edit(content=f"🔍 Импортирую {len(limited)} треков (ищу на YouTube)...")
         queries = [f"{sp['artist']} - {sp['title']}" for sp in limited]
+        try:
+            _st = await db_get_settings(interaction.guild.id)
+            _import_source = search_source_for(_st.get("default_search_source") or "youtube")
+        except Exception:
+            _import_source = None
         last_shown = 0
         for j in range(0, len(queries), 5):
-            for track in await search_many_youtube(queries[j:j + 5], batch_size=5):
+            for track in await search_many_youtube(queries[j:j + 5], batch_size=5, source=_import_source):
                 if track:
                     await db_add_track(playlist_id, track.title, track.uri or "", track.length)
                     added += 1
@@ -591,10 +596,15 @@ async def pl_import_file(interaction: discord.Interaction, name: str, file: disc
         artist = (row.get(artist_col) or "").strip() if artist_col else ""
         queries.append(f"{artist} - {title}" if artist else title)
 
+    try:
+        _st = await db_get_settings(interaction.guild.id)
+        _import_source = search_source_for(_st.get("default_search_source") or "youtube")
+    except Exception:
+        _import_source = None
     added = 0
     last_shown = 0
     for j in range(0, len(queries), 5):
-        for track in await search_many_youtube(queries[j:j + 5], batch_size=5):
+        for track in await search_many_youtube(queries[j:j + 5], batch_size=5, source=_import_source):
             if track:
                 await db_add_track(playlist_id, track.title, track.uri or "", track.length)
                 added += 1

@@ -16,7 +16,7 @@ from core import *
 
 from database import db_add_track, db_create_playlist, db_get_settings
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, parse_youtube_playlist_id, safe_play_track, search_source_for, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, parse_youtube_playlist_id, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 from views import TrackSelectView
 
@@ -230,18 +230,19 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         if player is None:
             await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
             return
-        await msg.edit(content=f"🔍 Ищу {len(limited_sp)} треков на YouTube...")
-        added_tracks = []
-        for sp in limited_sp:
-            sp_results, _ = await search_with_node_fallback(
-                f"{sp['artist']} - {sp['title']}",
-                wavelink.TrackSource.YouTube,
-            )
-            if sp_results:
-                track = sp_results[0] if isinstance(sp_results, list) else sp_results.tracks[0]
-                added_tracks.append(track)
+        try:
+            _st = await db_get_settings(interaction.guild.id)
+            _src_name = _st.get("default_search_source") or "youtube"
+        except Exception:
+            _src_name = "youtube"
+        _src = search_source_for(_src_name)
+        _src_label = {"youtube": "YouTube", "yandex": "Яндекс.Музыке",
+                      "soundcloud": "SoundCloud"}.get(_src_name, "YouTube")
+        await msg.edit(content=f"🔍 Ищу {len(limited_sp)} треков на {_src_label}...")
+        queries = [f"{sp['artist']} - {sp['title']}" for sp in limited_sp]
+        added_tracks = [t for t in await search_many_youtube(queries, batch_size=5, source=_src) if t]
         if not added_tracks:
-            await msg.edit(content="😕 Не удалось найти треки на YouTube.")
+            await msg.edit(content=f"😕 Не удалось найти треки на {_src_label}.")
             return
 
         fair = await get_fair_queue_enabled(interaction.guild_id)

@@ -34,7 +34,11 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     cancel_idle_timer(guild.id)
     state = get_player_state(guild.id)
     state["consec_fails"] = 0
-    state["fallback_tries"] = 0
+    # Счётчик подмен сбрасываем только когда заиграл ДРУГОЙ трек:
+    # подменённая версия имеет то же название и стартует перед падением.
+    if state.get("fallback_title") != track.title:
+        state["fallback_tries"] = 0
+        state.pop("fallback_title", None)
 
     is_birthday_track = state.get("birthday_playing", False)
 
@@ -202,9 +206,12 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
     tried = state.get("fallback_tries", 0)
     if track and not state.get("fallback_in_progress") and tried < 2:
         state["fallback_tries"] = tried + 1
+        state["fallback_title"] = track.title
         state["fallback_in_progress"] = True
         try:
-            alt = await find_alternative_track(track.title, getattr(track, "author", "") or "")
+            alt = await find_alternative_track(
+                track.title, getattr(track, "author", "") or "",
+                exclude_source=str(getattr(track, "source", "") or ""))
         except Exception as e:
             alt = None
             log.warning("Поиск замены не удался: %s", e)

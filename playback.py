@@ -281,14 +281,20 @@ async def search_many_youtube(queries: list, batch_size: int = 5, source=None) -
     return found
 
 
-async def find_alternative_track(title: str, author: str = ""):
+async def find_alternative_track(title: str, author: str = "", exclude_source: str = ""):
     """Ищет тот же трек на резервных источниках (SoundCloud, затем Яндекс).
     Возвращает трек или None. Нужен, когда основной источник (YouTube) недоступен."""
     query = f"{author} - {title}" if author else title
     query = query.strip()
     if not query:
         return None
-    for src in ("dzsearch", wavelink.TrackSource.SoundCloud, "ymsearch"):
+    ex = (exclude_source or "").lower()
+    chain = [("deezer", "dzsearch"),
+             ("soundcloud", wavelink.TrackSource.SoundCloud),
+             ("yandexmusic", "ymsearch")]
+    for src_name, src in chain:
+        if ex and ex in src_name:
+            continue
         try:
             results, _ = await search_with_node_fallback(query, src)
         except Exception:

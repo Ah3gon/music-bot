@@ -34,6 +34,7 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     cancel_idle_timer(guild.id)
     state = get_player_state(guild.id)
     state["consec_fails"] = 0
+    state["fallback_tries"] = 0
 
     is_birthday_track = state.get("birthday_playing", False)
 
@@ -198,7 +199,9 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
 
     # Источник недоступен (частая беда с YouTube) — ищем тот же трек
     # на резервных источниках и играем его вместо упавшего.
-    if track and not state.get("fallback_in_progress"):
+    tried = state.get("fallback_tries", 0)
+    if track and not state.get("fallback_in_progress") and tried < 2:
+        state["fallback_tries"] = tried + 1
         state["fallback_in_progress"] = True
         try:
             alt = await find_alternative_track(track.title, getattr(track, "author", "") or "")
@@ -212,7 +215,6 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
             owner = get_track_owner(guild.id, track)
             if owner:
                 tag_track(guild.id, alt, owner)
-            state["consec_fails"] = 0
             state["source_swapped"] = True
             if await safe_play_track(player, alt):
                 channel_id = state.get("text_channel_id")

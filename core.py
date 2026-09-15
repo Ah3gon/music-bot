@@ -38,6 +38,7 @@ IDLE_TIMEOUT          = 300
 EMPTY_CH_TIMEOUT      = 60
 SPOTIFY_TRACK_LIMIT   = 500
 PLAYLIST_TRACK_LIMIT  = 1000
+PREVIEW_MAX_MS        = 35000  # короче — считаем превью SoundCloud, не полный трек
 BOT_NAME              = "Surge"
 HISTORY_LIMIT         = 20
 QUEUE_DEFAULT_SHOW    = 15
@@ -99,4 +100,4 @@ def clear_player_state(guild_id: int):
 
 BRAND_COLOR = 0x8B5CF6  # фирменный фиолетовый (под логотип)
 
-__all__ = ['BRAND_COLOR', 'BOT_NAME', 'DATABASE_URL', 'DISCORD_TOKEN', 'EFFECTS', 'EMPTY_CH_TIMEOUT', 'GENIUS_TOKEN', 'HISTORY_LIMIT', 'IDLE_TIMEOUT', 'LYRICS_MAX_CHARS', 'MAX_INT32', 'NODES', 'PLAYLIST_NAME_MAX', 'PLAYLIST_TRACKS_SHOW', 'PLAYLIST_TRACK_LIMIT', 'QUEUE_DEFAULT_SHOW', 'SEEK_MAX_SECONDS', 'SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SPOTIFY_REFRESH_TOKEN', 'SPOTIFY_TRACK_LIMIT', 'TRACKS_PER_PAGE', 'active_votes', 'bot', 'clear_player_state', 'current_effect', 'empty_channel_tasks', 'get_player_state', 'idle_tasks', 'intents', 'log', 'player_state', 'track_history', 'track_user_map', 'tree', 'user_track_counts']
+__all__ = ['BRAND_COLOR', 'PREVIEW_MAX_MS', 'BOT_NAME', 'DATABASE_URL', 'DISCORD_TOKEN', 'EFFECTS', 'EMPTY_CH_TIMEOUT', 'GENIUS_TOKEN', 'HISTORY_LIMIT', 'IDLE_TIMEOUT', 'LYRICS_MAX_CHARS', 'MAX_INT32', 'NODES', 'PLAYLIST_NAME_MAX', 'PLAYLIST_TRACKS_SHOW', 'PLAYLIST_TRACK_LIMIT', 'QUEUE_DEFAULT_SHOW', 'SEEK_MAX_SECONDS', 'SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SPOTIFY_REFRESH_TOKEN', 'SPOTIFY_TRACK_LIMIT', 'TRACKS_PER_PAGE', 'active_votes', 'bot', 'clear_player_state', 'current_effect', 'empty_channel_tasks', 'get_player_state', 'idle_tasks', 'intents', 'log', 'player_state', 'track_history', 'track_user_map', 'tree', 'user_track_counts']

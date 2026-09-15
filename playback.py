@@ -293,11 +293,20 @@ async def find_alternative_track(title: str, author: str = ""):
             continue
         if not results:
             continue
-        if isinstance(results, list):
-            if results:
-                return results[0]
-        else:
-            tracks = getattr(results, "tracks", None)
-            if tracks:
-                return tracks[0]
+        tracks = results if isinstance(results, list) else (getattr(results, "tracks", None) or [])
+        pick = pick_full_track(tracks)
+        if pick is not None:
+            return pick
+    return None
+
+
+def pick_full_track(tracks: list):
+    """Из результатов поиска выбирает полный трек, пропуская 30-секундные
+    превью SoundCloud (лицензионные треки без подписки Go+)."""
+    if not tracks:
+        return None
+    for t in tracks:
+        length = getattr(t, "length", 0) or 0
+        if length > PREVIEW_MAX_MS:
+            return t
     return None

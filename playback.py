@@ -34,6 +34,8 @@ def search_source_for(name: str):
         return wavelink.TrackSource.SoundCloud
     if name == "yandex":
         return "ymsearch"
+    if name == "deezer":
+        return "dzsearch"
     return wavelink.TrackSource.YouTube
 
 
@@ -286,7 +288,7 @@ async def find_alternative_track(title: str, author: str = ""):
     query = query.strip()
     if not query:
         return None
-    for src in (wavelink.TrackSource.SoundCloud, "ymsearch"):
+    for src in ("dzsearch", wavelink.TrackSource.SoundCloud, "ymsearch"):
         try:
             results, _ = await search_with_node_fallback(query, src)
         except Exception:

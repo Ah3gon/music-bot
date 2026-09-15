@@ -881,8 +881,9 @@ PANEL_CHOICES = {
     ),
     "default_search_source": (
         "panel.o_source",
-        ["youtube", "yandex", "soundcloud"],
-        {"youtube": "YouTube", "yandex": "Yandex Music", "soundcloud": "SoundCloud"},
+        ["deezer", "soundcloud", "youtube", "yandex"],
+        {"deezer": "Deezer", "soundcloud": "SoundCloud",
+         "youtube": "YouTube", "yandex": "Yandex Music"},
     ),
 }
 PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source", "language"]
@@ -988,7 +989,8 @@ class SettingsPanelView(discord.ui.View):
                         value=t(self.guild.id, "panel.seconds", p0=s.get('idle_timeout', 300)), inline=True)
         embed.add_field(name=t(self.guild.id, "panel.f_empty"),
                         value=t(self.guild.id, "panel.seconds", p0=s.get('empty_timeout', 60)), inline=True)
-        _src = {"youtube": "YouTube", "yandex": t(self.guild.id, "panel.yandex"), "soundcloud": "SoundCloud"}
+        _src = {"youtube": "YouTube", "yandex": t(self.guild.id, "panel.yandex"),
+                "soundcloud": "SoundCloud", "deezer": "Deezer"}
         embed.add_field(name=t(self.guild.id, "panel.f_source"),
                         value=_src.get(s.get("default_search_source", "youtube"), "YouTube"), inline=True)
         embed.set_footer(text=t(self.guild.id, "panel.footer"))

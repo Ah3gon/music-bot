@@ -16,7 +16,7 @@ from core import *
 
 from database import db_add_track, db_create_playlist, db_get_settings
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, parse_youtube_playlist_id, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, fetch_youtube_playlist_video_ids, guild_search_source, is_preview, parse_youtube_playlist_id, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 from views import TrackSelectView
 
@@ -43,11 +43,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
     q_lower = query.lower()
     is_url_query = q_lower.startswith("http") or q_lower.startswith("sc:") or q_lower.startswith("spotify:")
     if not is_url_query:
-        try:
-            _s = await db_get_settings(interaction.guild.id)
-            source = search_source_for(_s.get("default_search_source") or "youtube")
-        except Exception:
-            pass
+        source = await guild_search_source(interaction.guild.id)
     search_error = None
     is_spotify_url = "spotify.com" in query.lower() or query.lower().startswith("spotify:")
 
@@ -90,7 +86,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
 
         player = await ensure_voice_connection(interaction)
         if player is None:
-            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            await msg.edit(content=interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
             return
 
         await msg.edit(content=f"🔍 Загружаю {len(video_ids)} треков...")
@@ -228,16 +224,16 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             return
         player = await ensure_voice_connection(interaction)
         if player is None:
-            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            await msg.edit(content=interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
             return
         try:
             _st = await db_get_settings(interaction.guild.id)
-            _src_name = _st.get("default_search_source") or "youtube"
+            _src_name = _st.get("default_search_source") or DEFAULT_SEARCH_SOURCE
         except Exception:
-            _src_name = "youtube"
+            _src_name = DEFAULT_SEARCH_SOURCE
         _src = search_source_for(_src_name)
         _src_label = {"youtube": "YouTube", "yandex": "Яндекс.Музыке",
-                      "soundcloud": "SoundCloud"}.get(_src_name, "YouTube")
+                      "soundcloud": "SoundCloud", "deezer": "Deezer"}.get(_src_name, "Deezer")
         await msg.edit(content=f"🔍 Ищу {len(limited_sp)} треков на {_src_label}...")
         queries = [f"{sp['artist']} - {sp['title']}" for sp in limited_sp]
         added_tracks = [t for t in await search_many_youtube(queries, batch_size=5, source=_src) if t]
@@ -310,7 +306,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             return
         player = await ensure_voice_connection(interaction)
         if player is None:
-            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            await msg.edit(content=interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
             return
 
         fair = await get_fair_queue_enabled(interaction.guild_id)
@@ -350,7 +346,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             return
         player = await ensure_voice_connection(interaction)
         if player is None:
-            await msg.edit(content="❗ Не удалось подключиться к голосовому каналу.")
+            await msg.edit(content=interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
             return
         track = results[0]
         fair = await get_fair_queue_enabled(interaction.guild_id)
@@ -378,7 +374,10 @@ async def play_cmd(interaction: discord.Interaction, query: str):
             pass
         return
 
-    tracks = results[:5]
+    tracks = [tr for tr in results if not is_preview(tr)][:5]
+    if not tracks:
+        await msg.edit(content="😕 Нашлись только 30-секундные превью — полных версий нет.")
+        return
     lines = ["**Результаты поиска:**\n"]
     for i, t in enumerate(tracks, 1):
         lines.append(f"`{i}.` {t.title} `[{format_duration(t.length)}]`")

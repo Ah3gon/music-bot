@@ -33,11 +33,16 @@ async def skip_cmd(interaction: discord.Interaction):
     if core.db_pool:
         settings = await db_get_settings(interaction.guild_id)
         if settings.get("vote_skip_enabled") and not await is_dj(interaction.user):
-            await interaction.response.defer()
+            await interaction.response.defer(ephemeral=True)
             await start_vote_skip(
                 interaction.user, interaction.guild,
                 interaction.channel, settings.get("vote_skip_percent", 50)
             )
+            # Голосование — отдельным сообщением в канал; «думает…» убираем
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
             return
 
     if not await check_dj(interaction):
@@ -62,13 +67,15 @@ async def skipto_cmd(interaction: discord.Interaction, position: int):
     if position < 1 or position > len(q):
         await interaction.response.send_message(t(interaction.guild_id, "err.bad_position", max=len(q)))
         return
+    # Режим повтора выключаем ДО q.get(): в нём get() возвращает текущий
+    # трек и ничего не убирает из очереди
+    if player.queue.mode == wavelink.QueueMode.loop:
+        player.queue.mode = wavelink.QueueMode.normal
     for _ in range(position - 1):
         try:
             q.get()
         except Exception:
             break
-    if player.queue.mode == wavelink.QueueMode.loop:
-        player.queue.mode = wavelink.QueueMode.normal
     await player.skip(force=True)
     await interaction.response.send_message(t(interaction.guild_id, "ctl.skipto", position=position))
 
@@ -282,10 +289,16 @@ async def history_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(t(interaction.guild_id, "queue.history_empty"), ephemeral=True)
         return
     lines = [t(interaction.guild_id, "queue.history_title") + "\n"]
+    size = len(lines[0])
     for i, tr in enumerate(history, 1):
         link = (" — [{}]({})".format(t(interaction.guild_id, "queue.open_link"), tr["uri"])
                 if tr.get("uri") else "")
-        lines.append(f"`{i}.` {tr['title']} `[{format_duration(tr['length'])}]`{link}")
+        line = f"`{i}.` {tr['title']} `[{format_duration(tr['length'])}]`{link}"
+        # Сообщение — максимум 2000 символов; длинные ссылки быстро его забивают
+        if size + len(line) + 1 > 1990:
+            break
+        lines.append(line)
+        size += len(line) + 1
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 

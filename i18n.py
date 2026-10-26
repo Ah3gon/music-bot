@@ -23,6 +23,10 @@ STRINGS = {
                             "en": "❗ Join a voice channel first."},
     "err.not_in_channel":  {"ru": "❗ Бот не в канале.",
                             "en": "❗ The bot is not in a voice channel."},
+    "err.bot_busy":        {"ru": "❗ Бот играет в другом канале для других слушателей. "
+                                  "Зайди к ним или попроси DJ.",
+                            "en": "❗ The bot is playing for other listeners in another "
+                                  "channel. Join them or ask a DJ."},
     "err.nothing_playing": {"ru": "❗ Ничего не играет.",
                             "en": "❗ Nothing is playing."},
     "err.no_db":           {"ru": "❗ База данных недоступна.",

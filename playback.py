@@ -15,7 +15,8 @@ from typing import Optional
 import core
 from core import *
 
-from helpers import cancel_empty_channel_timer, cancel_idle_timer
+from helpers import cancel_empty_channel_timer, cancel_idle_timer, is_dj
+from i18n import t
 from database import db_get_settings
 
 # ─────────────────────────────────────────────
@@ -34,9 +35,19 @@ def search_source_for(name: str):
         return wavelink.TrackSource.SoundCloud
     if name == "yandex":
         return "ymsearch"
-    if name == "deezer":
-        return "dzsearch"
-    return wavelink.TrackSource.YouTube
+    if name == "youtube":
+        return wavelink.TrackSource.YouTube
+    return "dzsearch"
+
+
+async def guild_search_source(guild_id: int):
+    """Источник поиска из настроек сервера (по умолчанию Deezer)."""
+    try:
+        s = await db_get_settings(guild_id)
+        name = s.get("default_search_source") or DEFAULT_SEARCH_SOURCE
+    except Exception:
+        name = DEFAULT_SEARCH_SOURCE
+    return search_source_for(name)
 
 
 async def safe_play_track(
@@ -109,6 +120,9 @@ async def connect_to_voice(
         try:
             s = await db_get_settings(voice_channel.guild.id)
             await player.set_volume(int(s.get("default_volume") or 100))
+            # Встроенный таймер wavelink (по умолчанию 300 с) выкидывал бота
+            # раньше, чем idle_timeout из панели — выравниваем их
+            player.inactive_timeout = int(s.get("idle_timeout") or IDLE_TIMEOUT)
         except Exception:
             pass
         return player
@@ -230,6 +244,13 @@ async def fetch_youtube_playlist_video_ids(playlist_id: str, limit: int = 200) -
     return video_ids
 
 
+async def can_move_bot(member: discord.Member, player: wavelink.Player) -> bool:
+    """Можно ли перетащить бота к себе: в его канале никого нет, или это DJ.
+    Иначе любой утаскивал бота посреди чужой музыки."""
+    listeners = [m for m in (player.channel.members if player.channel else []) if not m.bot]
+    return not listeners or await is_dj(member)
+
+
 async def ensure_voice_connection(
     interaction: discord.Interaction,
 ) -> Optional[wavelink.Player]:
@@ -242,6 +263,10 @@ async def ensure_voice_connection(
             if player is None:
                 return None
         elif player.channel != interaction.user.voice.channel:
+            if not await can_move_bot(interaction.user, player):
+                # Вызывающий код покажет это вместо «не удалось подключиться»
+                interaction.extras["voice_error"] = t(interaction.guild_id, "err.bot_busy")
+                return None
             await player.move_to(interaction.user.voice.channel)
     except Exception as e:
         log.warning("Voice connect error: %s", e)
@@ -255,10 +280,10 @@ async def ensure_voice_connection(
 
 async def search_many_youtube(queries: list, batch_size: int = 5, source=None) -> list:
     """Ищет список запросов пачками (параллельно), сохраняя порядок.
-    source — источник поиска (по умолчанию YouTube).
+    source — источник поиска (по умолчанию Deezer).
     Возвращает список треков; None — если по запросу ничего не найдено."""
     if source is None:
-        source = wavelink.TrackSource.YouTube
+        source = search_source_for(DEFAULT_SEARCH_SOURCE)
     found = []
 
     async def _one(q):
@@ -268,12 +293,8 @@ async def search_many_youtube(queries: list, batch_size: int = 5, source=None) -
             return None
         if not r:
             return None
-        if isinstance(r, list):
-            return r[0] if r else None
-        tracks = getattr(r, "tracks", None)
-        if tracks:
-            return tracks[0]
-        return None
+        tracks = r if isinstance(r, list) else (getattr(r, "tracks", None) or [])
+        return pick_full_track(tracks)
 
     for i in range(0, len(queries), batch_size):
         batch = queries[i:i + batch_size]
@@ -308,13 +329,18 @@ async def find_alternative_track(title: str, author: str = "", exclude_source: s
     return None
 
 
+def is_preview(track) -> bool:
+    """30-секундное превью SoundCloud (лицензионный трек без подписки Go+)."""
+    length = getattr(track, "length", 0) or 0
+    return (str(getattr(track, "source", "") or "") == "soundcloud"
+            and 0 < length <= PREVIEW_MAX_MS)
+
+
 def pick_full_track(tracks: list):
-    """Из результатов поиска выбирает полный трек, пропуская 30-секундные
-    превью SoundCloud (лицензионные треки без подписки Go+)."""
+    """Из результатов поиска выбирает первый трек, не являющийся превью."""
     if not tracks:
         return None
-    for t in tracks:
-        length = getattr(t, "length", 0) or 0
-        if length > PREVIEW_MAX_MS:
-            return t
+    for tr in tracks:
+        if not is_preview(tr):
+            return tr
     return None

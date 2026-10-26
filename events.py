@@ -14,9 +14,9 @@ import datetime
 import core
 from core import *
 
-from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, init_db
+from database import db_get_birthday, db_get_settings, db_increment_stats, db_increment_user_stats, db_load_languages, init_db
 from helpers import add_to_history, cancel_empty_channel_timer, cancel_idle_timer, full_disconnect, get_track_owner, is_birthday_today, now_playing_embed, start_idle_timer, tag_track
-from playback import connect_to_voice, find_alternative_track, safe_play_track, search_with_node_fallback
+from playback import connect_to_voice, find_alternative_track, guild_search_source, pick_full_track, safe_play_track, search_with_node_fallback
 from views import PlayerControls
 
 # ─────────────────────────────────────────────
@@ -43,7 +43,8 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
         state["fallback_tries"] = 0
         state.pop("fallback_title", None)
 
-    is_birthday_track = state.get("birthday_playing", False)
+    is_birthday_track = (track is not None
+                         and state.get("birthday_track") == track.encoded)
 
     add_to_history(guild.id, track)
 
@@ -107,27 +108,37 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
     channel_id = state.get("text_channel_id")
     channel = guild.get_channel(channel_id) if channel_id else None
 
-    if state.get("birthday_playing"):
-        state["birthday_playing"] = False
+    # День рождения. Треки узнаём по encoded, а не по флагу: иначе конец
+    # прерванного трека (его пропускают ради поздравления) принимался за
+    # конец самого поздравления.
+    enc = payload.track.encoded if payload.track is not None else None
+    bday_interrupted = enc is not None and state.get("birthday_interrupted") == enc
+    bday_ended = enc is not None and state.get("birthday_track") == enc
+    if bday_interrupted:
+        state.pop("birthday_interrupted", None)
+    if bday_ended:
+        state.pop("birthday_track", None)
         resume = state.pop("birthday_resume", None)
-        if resume:
-            try:
-                state["birthday_seek_to"] = resume["position"]
-            except Exception as e:
-                log.warning("Birthday resume setup error: %s", e)
+        prev_mode = state.pop("birthday_prev_mode", None)
+        if prev_mode is not None:
+            player.queue.mode = prev_mode
+        if resume and not player.queue.is_empty:
+            seek_to = resume["position"]
 
-    seek_to = state.get("birthday_seek_to")
-    if seek_to is not None and not player.queue.is_empty:
-        async def _seek_after_start():
-            await asyncio.sleep(0.8)
-            p: wavelink.Player = guild.voice_client
-            if p and p.current:
-                try:
-                    await p.seek(min(seek_to, p.current.length))
-                except Exception as e:
-                    log.debug("Birthday seek error: %s", e)
-            state.pop("birthday_seek_to", None)
-        asyncio.create_task(_seek_after_start())
+            async def _seek_after_start():
+                await asyncio.sleep(0.8)
+                p: wavelink.Player = guild.voice_client
+                if p and p.current:
+                    try:
+                        await p.seek(min(seek_to, p.current.length))
+                    except Exception as e:
+                        log.debug("Birthday seek error: %s", e)
+            asyncio.create_task(_seek_after_start())
+    if bday_interrupted or bday_ended:
+        # Ни поздравление, ни прерванный трек не повторяем: прерванный уже
+        # стоит в очереди сразу после поздравления
+        await _play_next(player, guild, state, channel)
+        return
 
     if player.queue.mode == wavelink.QueueMode.loop:
         ok = await safe_play_track(player, payload.track)
@@ -309,13 +320,16 @@ async def _play_birthday_now(member: discord.Member,
                               birthday: dict):
     song_query = birthday.get("birthday_song") or "Happy Birthday instrumental"
     results, err = await search_with_node_fallback(
-        song_query, wavelink.TrackSource.YouTube
+        song_query, await guild_search_source(member.guild.id)
     )
     if err:
         log.warning("Birthday search error: %s", err)
     if not results:
         return
-    bday_track = results[0] if isinstance(results, list) else results.tracks[0]
+    found = results if isinstance(results, list) else results.tracks
+    bday_track = pick_full_track(found)
+    if bday_track is None:
+        return
 
     player: wavelink.Player = member.guild.voice_client
     state = get_player_state(member.guild.id)
@@ -340,7 +354,7 @@ async def _play_birthday_now(member: discord.Member,
             player.autoplay = wavelink.AutoPlayMode.disabled
             if text_channel:
                 state["text_channel_id"] = text_channel.id
-            state["birthday_playing"] = True
+            state["birthday_track"] = bday_track.encoded
             await player.play(bday_track)
             if text_channel:
                 try:
@@ -357,6 +371,7 @@ async def _play_birthday_now(member: discord.Member,
     if player.channel != channel:
         return
 
+    state["birthday_track"] = bday_track.encoded
     current_track = player.current
     if current_track is None:
         await player.queue.put_wait(bday_track)
@@ -364,41 +379,28 @@ async def _play_birthday_now(member: discord.Member,
             await player.play(player.queue.get())
         return
 
-    state["birthday_resume"] = {
-        "uri": current_track.uri,
-        "title": current_track.title,
-        "position": player.position,
-    }
-    state["birthday_playing"] = True
+    state["birthday_resume"] = {"position": player.position}
 
     prev_mode = player.queue.mode
     if prev_mode == wavelink.QueueMode.loop:
         player.queue.mode = wavelink.QueueMode.normal
 
     try:
-        resume_results, _ = await search_with_node_fallback(
-            current_track.uri or current_track.title,
-            wavelink.TrackSource.YouTube,
-        )
-        resume_track = None
-        if resume_results:
-            resume_track = resume_results[0] if isinstance(resume_results, list) \
-                else resume_results.tracks[0]
-
+        # Прерванный трек ставим сразу за поздравлением и доигрываем с той же
+        # позиции. Искать его заново не нужно — берём тот же объект.
         try:
             player.queue.put_at(0, bday_track)
-            if resume_track:
-                player.queue.put_at(1, resume_track)
+            player.queue.put_at(1, current_track)
         except AttributeError:
             current_queue = list(player.queue)
             player.queue.clear()
             await player.queue.put_wait(bday_track)
-            if resume_track:
-                await player.queue.put_wait(resume_track)
+            await player.queue.put_wait(current_track)
             for t in current_queue:
                 await player.queue.put_wait(t)
 
         state["birthday_prev_mode"] = prev_mode
+        state["birthday_interrupted"] = current_track.encoded
         await player.skip(force=True)
 
         if text_channel:
@@ -411,8 +413,15 @@ async def _play_birthday_now(member: discord.Member,
                 pass
     except Exception as e:
         log.warning("Birthday interrupt error: %s", e)
-        state.pop("birthday_resume", None)
-        state["birthday_playing"] = False
+        for k in ("birthday_resume", "birthday_track", "birthday_interrupted",
+                  "birthday_prev_mode"):
+            state.pop(k, None)
+        player.queue.mode = prev_mode
+
+
+# Кого уже поздравили сегодня: {guild_id: {user_id}}. Отдельно от player_state,
+# потому что full_disconnect его очищает — и поздравление звучало повторно.
+_birthday_greeted: dict[int, set] = {}
 
 
 async def _handle_birthday(member: discord.Member, channel: discord.VoiceChannel):
@@ -425,8 +434,7 @@ async def _handle_birthday(member: discord.Member, channel: discord.VoiceChannel
         return
     if not birthday or not is_birthday_today(birthday["birth_day"], birthday["birth_month"]):
         return
-    state = get_player_state(member.guild.id)
-    already = state.setdefault("birthday_greeted", set())
+    already = _birthday_greeted.setdefault(member.guild.id, set())
     if member.id in already:
         return
     already.add(member.id)
@@ -437,6 +445,12 @@ async def _handle_birthday(member: discord.Member, channel: discord.VoiceChannel
 async def on_voice_state_update(member: discord.Member,
                                 before: discord.VoiceState,
                                 after: discord.VoiceState):
+    if bot.user and member.id == bot.user.id:
+        # Бота отключили от голоса вручную (кик, удалили канал) — чистим
+        # очередь, таймеры и состояние, иначе они висят до рестарта
+        if before.channel and not after.channel:
+            await full_disconnect(member.guild)
+        return
     if member.bot:
         return
 
@@ -508,8 +522,7 @@ async def reset_birthday_flags_daily():
             await asyncio.sleep(wait_seconds)
         except asyncio.CancelledError:
             return
-        for state in player_state.values():
-            state.pop("birthday_greeted", None)
+        _birthday_greeted.clear()
         log.info("Birthday greeted flags cleared")
 
 
@@ -528,6 +541,7 @@ async def on_ready():
     if DATABASE_URL:
         try:
             await init_db()
+            await db_load_languages()
             log.info("База данных подключена")
         except Exception as e:
             log.error("Ошибка инициализации БД: %s", e)

@@ -230,7 +230,7 @@ async def pl_play(interaction: discord.Interaction, name: str):
 
     player = await ensure_voice_connection(interaction)
     if player is None:
-        await interaction.followup.send("❗ Не удалось подключиться к голосовому каналу.")
+        await interaction.followup.send(interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
         return
 
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
@@ -387,11 +387,11 @@ async def pl_import(interaction: discord.Interaction, url: str, name: str):
             await msg.edit(content=f"❌ Не удалось получить треки из Spotify (_{sp_error}_).")
             return
         limited = spotify_tracks[:PLAYLIST_TRACK_LIMIT]
-        await msg.edit(content=f"🔍 Импортирую {len(limited)} треков (ищу на YouTube)...")
+        await msg.edit(content=f"🔍 Импортирую {len(limited)} треков (ищу в источнике сервера)...")
         queries = [f"{sp['artist']} - {sp['title']}" for sp in limited]
         try:
             _st = await db_get_settings(interaction.guild.id)
-            _import_source = search_source_for(_st.get("default_search_source") or "youtube")
+            _import_source = search_source_for(_st.get("default_search_source") or DEFAULT_SEARCH_SOURCE)
         except Exception:
             _import_source = None
         last_shown = 0
@@ -453,7 +453,8 @@ async def pl_edit(interaction: discord.Interaction, name: str):
     if not tracks:
         await interaction.response.send_message(f"📭 Плейлист **{clean}** пуст.", ephemeral=True)
         return
-    view = PlaylistEditView(interaction.user.id, playlist["id"], clean, tracks)
+    view = PlaylistEditView(interaction.user.id, playlist["id"], clean, tracks,
+                            guild_id=interaction.guild_id)
     await interaction.response.send_message(view._text(), view=view, ephemeral=True)
     view.message = await interaction.original_response()
 
@@ -586,7 +587,7 @@ async def pl_import_file(interaction: discord.Interaction, name: str, file: disc
 
     limited = rows[:PLAYLIST_TRACK_LIMIT]
     msg = await interaction.followup.send(
-        f"🔍 Импортирую {len(limited)} треков из файла (ищу на YouTube)...",
+        f"🔍 Импортирую {len(limited)} треков из файла (ищу в источнике сервера)...",
         ephemeral=True, wait=True)
     queries = []
     for row in limited:
@@ -598,7 +599,7 @@ async def pl_import_file(interaction: discord.Interaction, name: str, file: disc
 
     try:
         _st = await db_get_settings(interaction.guild.id)
-        _import_source = search_source_for(_st.get("default_search_source") or "youtube")
+        _import_source = search_source_for(_st.get("default_search_source") or DEFAULT_SEARCH_SOURCE)
     except Exception:
         _import_source = None
     added = 0
@@ -816,7 +817,7 @@ async def spl_play(interaction: discord.Interaction, name: str):
         return
     player = await ensure_voice_connection(interaction)
     if player is None:
-        await interaction.followup.send("❗ Не удалось подключиться к голосовому каналу.")
+        await interaction.followup.send(interaction.extras.get("voice_error") or "❗ Не удалось подключиться к голосовому каналу.")
         return
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
     loaded = []

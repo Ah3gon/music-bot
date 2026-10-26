@@ -57,7 +57,13 @@ def increment_user_track_count(guild_id: int, user_id: int, count: int = 1):
 
 
 def get_user_track_count(guild_id: int, user_id: int) -> int:
-    return user_track_counts.get(guild_id, {}).get(user_id, 0)
+    """Сколько треков пользователя сейчас ждут в очереди. Раньше считались все
+    добавленные за сессию: счётчик не уменьшался, и человек упирался в лимит."""
+    guild = bot.get_guild(guild_id)
+    player = guild.voice_client if guild else None
+    if not player:
+        return 0
+    return sum(1 for tr in player.queue if get_track_owner(guild_id, tr) == user_id)
 
 
 def reset_track_counts(guild_id: int):
@@ -112,40 +118,36 @@ async def add_tracks_fairly(
     user_id: int,
     enabled: bool = True,
 ):
-    """Добавляет треки, чередуя их с чужими если fair_queue включено."""
+    """Добавляет треки. Если fair_queue включено — раскладывает очередь
+    по кругу между заказчиками: A1 B1 C1 A2 B2 A3 …, сохраняя порядок
+    треков каждого. Работает и для одиночных треков, не только плейлистов."""
     guild_id = player.guild.id
+    if not tracks:
+        return
+    existing = list(player.queue)
+    # Владельцев уже стоящих треков запоминаем ДО новых меток: identifier
+    # у одинаковых треков совпадает, и новая метка перезаписала бы старую
+    owners = {id(tr): get_track_owner(guild_id, tr) for tr in existing}
+    owners.update({id(tr): user_id for tr in tracks})
     for tr in tracks:
         tag_track(guild_id, tr, user_id)
 
-    if not enabled or len(tracks) <= 1:
+    if not enabled:
         for tr in tracks:
             await player.queue.put_wait(tr)
         return
 
-    existing = list(player.queue)
-    foreign_tracks = [
-        tr for tr in existing if get_track_owner(guild_id, tr) != user_id
-    ]
+    # Группы по заказчику в порядке первого появления в очереди
 
-    # Если чужих треков < 2 — не чередуем, просто добавляем в конец
-    if len(foreign_tracks) < 2:
-        for tr in tracks:
-            await player.queue.put_wait(tr)
-        return
-
-    my_existing = [tr for tr in existing if get_track_owner(guild_id, tr) == user_id]
+    groups: dict = {}
+    for tr in existing + list(tracks):
+        groups.setdefault(owners[id(tr)], []).append(tr)
 
     new_queue = []
-    max_len = max(len(foreign_tracks), len(tracks))
-    fi, ni = 0, 0
-    for _ in range(max_len):
-        if fi < len(foreign_tracks):
-            new_queue.append(foreign_tracks[fi])
-            fi += 1
-        if ni < len(tracks):
-            new_queue.append(tracks[ni])
-            ni += 1
-    new_queue.extend(my_existing)
+    for i in range(max(len(g) for g in groups.values())):
+        for g in groups.values():
+            if i < len(g):
+                new_queue.append(g[i])
 
     player.queue.clear()
     for tr in new_queue:

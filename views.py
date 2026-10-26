@@ -18,7 +18,7 @@ from core import *
 from i18n import t
 from database import db_add_track, db_create_playlist, db_delete_track, db_get_playlist, db_get_settings, db_get_tracks, db_get_user_playlists, db_reset_settings, db_save_settings, db_update_track
 from helpers import add_tracks_fairly, cancel_idle_timer, format_duration, full_disconnect, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
-from playback import connect_to_voice, search_with_node_fallback
+from playback import can_move_bot, connect_to_voice, guild_search_source, search_with_node_fallback
 
 # ─────────────────────────────────────────────
 #  Голосование за скип
@@ -60,14 +60,18 @@ class VoteSkipView(discord.ui.View):
             return 1
         return max(1, len([m for m in player.channel.members if not m.bot]))
 
+    def needed_votes(self, total: int) -> int:
+        # Округляем вверх: при 3 слушателях и 50% нужно 2 голоса, а не 1
+        return max(1, -(-total * self.required_percent // 100))
+
     def is_passed(self) -> bool:
         total = self.get_voter_count()
-        needed = max(1, int(total * self.required_percent / 100))
+        needed = self.needed_votes(total)
         return len(self.votes_yes) >= needed
 
     def status_text(self) -> str:
         total = self.get_voter_count()
-        needed = max(1, int(total * self.required_percent / 100))
+        needed = self.needed_votes(total)
         return (
             t(self.guild.id, "vote.prompt", p0=len(self.votes_yes), p1=len(self.votes_no), p2=needed, p3=total)
         )
@@ -635,6 +639,14 @@ class TrackSelectView(discord.ui.View):
                         self.stop()
                         return
                 elif player.channel != self.voice_channel:
+                    if not await can_move_bot(interaction.user, player):
+                        try:
+                            await self.search_msg.edit(
+                                content=t(interaction.guild_id, "err.bot_busy"), view=None)
+                        except discord.HTTPException:
+                            pass
+                        self.stop()
+                        return
                     await player.move_to(self.voice_channel)
             except Exception as e:
                 log.warning("Voice connect error: %s", e)
@@ -660,7 +672,7 @@ class TrackSelectView(discord.ui.View):
                 increment_user_track_count(self.guild.id, self.user_id)
                 try:
                     await self.search_msg.edit(
-                        content=t(interaction.guild_id, "play.added", p0=track.title, p1=format_duration(track.length)),
+                        content=t(interaction.guild_id, "play.added", title=track.title, dur=format_duration(track.length)),
                         view=None,
                     )
                 except discord.HTTPException:
@@ -794,7 +806,8 @@ class PlaylistEditView(discord.ui.View):
         if not tr:
             return
         await interaction.response.defer()
-        results, _ = await search_with_node_fallback(tr["title"], wavelink.TrackSource.YouTube)
+        results, _ = await search_with_node_fallback(
+            tr["title"], await guild_search_source(self.guild_id))
         if results:
             if isinstance(results, wavelink.Playlist):
                 cand = results.tracks[:5]
@@ -992,7 +1005,7 @@ class SettingsPanelView(discord.ui.View):
         _src = {"youtube": "YouTube", "yandex": t(self.guild.id, "panel.yandex"),
                 "soundcloud": "SoundCloud", "deezer": "Deezer"}
         embed.add_field(name=t(self.guild.id, "panel.f_source"),
-                        value=_src.get(s.get("default_search_source", "youtube"), "YouTube"), inline=True)
+                        value=_src.get(s.get("default_search_source", DEFAULT_SEARCH_SOURCE), "Deezer"), inline=True)
         embed.set_footer(text=t(self.guild.id, "panel.footer"))
         return embed
 

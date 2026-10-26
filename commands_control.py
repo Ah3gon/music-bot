@@ -245,8 +245,12 @@ async def lyrics_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     title = player.current.title
     duration = player.current.length
+    # У YouTube исполнитель — название канала, ему не верим: угадываем из названия
+    author = ""
+    if getattr(player.current, "source", "") != "youtube":
+        author = getattr(player.current, "author", "") or ""
 
-    result = await fetch_lyrics(title, duration)
+    result = await fetch_lyrics(title, duration, author)
     if not result or not result.get("text"):
         sources = ["LRClib"]
         if GENIUS_TOKEN:

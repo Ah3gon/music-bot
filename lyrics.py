@@ -20,24 +20,39 @@ from core import *
 # ─────────────────────────────────────────────
 #  LYRICS: LRClib → Genius → lyrics.ovh
 # ─────────────────────────────────────────────
-def _clean_title(title: str) -> tuple[str, str]:
-    parts = re.split(r'\s*[-–—|]\s*', title, maxsplit=1)
-    if len(parts) == 2:
+def _clean_title(title: str, author: str = "") -> tuple[str, str]:
+    # Скобки убираем до разбора: в «(Radio Edit - feat. ...)» тоже есть дефис
+    title = re.sub(r'\(.*?\)|\[.*?\]|\{.*?\}', '', title).strip()
+    # Режем только по дефису с пробелами: «Слова-паразиты» — это одно название
+    parts = re.split(r'\s+[-–—|]\s+', title, maxsplit=1)
+    if author:
+        # Исполнитель известен (Deezer, SoundCloud) — из названия убираем
+        # хвосты вроде « - Remastered 2011» или повтор исполнителя в начале
+        artist = author.strip()
+        if len(parts) == 2 and parts[0].strip().lower() == artist.lower():
+            song = parts[1].strip()
+        else:
+            song = parts[0].strip()
+    elif len(parts) == 2:
         artist, song = parts[0].strip(), parts[1].strip()
     else:
         artist, song = "", title.strip()
-    song = re.sub(r'\(.*?\)|\[.*?\]|\{.*?\}', '', song).strip()
-    song = re.sub(r'\s*(feat\.?|ft\.?|featuring|prod\.?(\sby)?|w[/\\])\s+.*$',
+    # (?<!\w) — только отдельное слово: иначе «Daft Punk» режется по «ft» до «Da»
+    song = re.sub(r'(?<!\w)(feat\.?|ft\.?|featuring|prod\.?(\sby)?|w[/\\])\s+.*$',
                   '', song, flags=re.IGNORECASE).strip()
-    song = re.sub(r'\b(official|lyric|audio|video|music|mv|hd|4k|hq)\s*(video|audio)?\b.*$',
+    # Пометки YouTube вне скобок; просто слово «music» в названии не трогаем
+    song = re.sub(r'\s+(official\s+(music\s+)?(video|audio)|lyrics?\s+video|music\s+video'
+                  r'|lyrics|mv|hd|4k|hq)\s*$',
                   '', song, flags=re.IGNORECASE).strip()
-    artist = re.sub(r'\s*(feat\.?|ft\.?|featuring|x|&)\s+.*$', '', artist,
+    artist = re.sub(r'(?<!\w)(feat\.?|ft\.?|featuring|x|&)\s+.*$', '', artist,
                     flags=re.IGNORECASE).strip()
+    artist = artist.split(",")[0].strip()
     return artist, song
 
 
-async def _fetch_lrclib(title: str, duration_ms: Optional[int] = None) -> Optional[dict]:
-    artist, song = _clean_title(title)
+async def _fetch_lrclib(title: str, duration_ms: Optional[int] = None,
+                        author: str = "") -> Optional[dict]:
+    artist, song = _clean_title(title, author)
     if not song:
         return None
 
@@ -71,9 +86,14 @@ async def _fetch_lrclib(title: str, duration_ms: Optional[int] = None) -> Option
                 "synced": result.get("syncedLyrics"),
             }
 
-    # 2. Поиск
-    query = f"{artist} {song}".strip() if artist else song
-    results = await _try_request("https://lrclib.net/api/search", {"q": query})
+    # 2. Поиск по полям, затем общим запросом
+    results = None
+    if artist:
+        results = await _try_request("https://lrclib.net/api/search",
+                                     {"track_name": song, "artist_name": artist})
+    if not isinstance(results, list) or len(results) == 0:
+        query = f"{artist} {song}".strip() if artist else song
+        results = await _try_request("https://lrclib.net/api/search", {"q": query})
     if not isinstance(results, list) or len(results) == 0:
         log.info("LRClib: ничего не найдено")
         return None
@@ -105,10 +125,10 @@ def _is_bad_genius_hit(hit: dict) -> bool:
     return False
 
 
-async def _fetch_genius(title: str) -> Optional[str]:
+async def _fetch_genius(title: str, author: str = "") -> Optional[str]:
     if not GENIUS_TOKEN:
         return None
-    artist, song = _clean_title(title)
+    artist, song = _clean_title(title, author)
     query = f"{artist} {song}".strip() if artist else song
     if not query:
         return None
@@ -191,8 +211,8 @@ def _parse_genius_html(html: str) -> Optional[str]:
     return combined or None
 
 
-async def _fetch_lyricsovh(title: str) -> Optional[str]:
-    artist, song = _clean_title(title)
+async def _fetch_lyricsovh(title: str, author: str = "") -> Optional[str]:
+    artist, song = _clean_title(title, author)
     if not song:
         return None
     timeout = aiohttp.ClientTimeout(total=5)
@@ -214,10 +234,12 @@ async def _fetch_lyricsovh(title: str) -> Optional[str]:
     return None
 
 
-async def fetch_lyrics(title: str, duration_ms: Optional[int] = None) -> Optional[dict]:
-    """Возвращает dict: {'text': ..., 'source': ..., 'synced': bool} либо None."""
+async def fetch_lyrics(title: str, duration_ms: Optional[int] = None,
+                       author: str = "") -> Optional[dict]:
+    """Возвращает dict: {'text': ..., 'source': ..., 'synced': bool} либо None.
+    author — исполнитель из трека; без него угадываем по «Исполнитель - Песня»."""
     # 1. LRClib
-    result = await _fetch_lrclib(title, duration_ms)
+    result = await _fetch_lrclib(title, duration_ms, author)
     if result:
         text = result.get("plain")
         if not text and result.get("synced"):
@@ -230,12 +252,12 @@ async def fetch_lyrics(title: str, duration_ms: Optional[int] = None) -> Optiona
             }
 
     # 2. Genius
-    text = await _fetch_genius(title)
+    text = await _fetch_genius(title, author)
     if text:
         return {"text": text, "source": "Genius", "synced": False}
 
     # 3. lyrics.ovh
-    text = await _fetch_lyricsovh(title)
+    text = await _fetch_lyricsovh(title, author)
     if text:
         return {"text": text, "source": "lyrics.ovh", "synced": False}
 

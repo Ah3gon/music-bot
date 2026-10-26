@@ -99,6 +99,59 @@ def test_fair_queue_disabled_appends():
     assert got == ["A1", "A2", "B1"], f"без справедливой очереди: {got}"
 
 
+def test_fair_queue_keeps_current_track_owner():
+    # Статистика пишется, когда трек доиграл, — метка играющего не должна пропасть
+    async def scenario():
+        p = FakePlayer(guild_id=-3)
+        p.current = FakeTrack("NOW")
+        helpers.tag_track(-3, p.current, 10)
+        await helpers.add_tracks_fairly(p, [FakeTrack("A1"), FakeTrack("A2")], 10, True)
+        await helpers.add_tracks_fairly(p, [FakeTrack("B1")], 20, True)
+        return helpers.get_track_owner(-3, p.current)
+    try:
+        owner = asyncio.run(scenario())
+    finally:
+        helpers.track_user_map.pop(-3, None)
+    assert owner == 10, f"владелец играющего трека потерялся: {owner}"
+
+
+def test_yandex_removed():
+    assert all("yandex" not in name for name, _ in playback.ALT_SOURCES), "Яндекс в цепочке автоподмены"
+    assert "yandex" not in views.PANEL_CHOICES["default_search_source"][1], "Яндекс в панели"
+
+
+def test_load_saved_track():
+    calls = []
+
+    async def fake_search(query, source, **kw):
+        calls.append(query)
+        if query.startswith("https://www.deezer.com/"):
+            return [FakeTrack("по ссылке")], None
+        if query.startswith("https://"):
+            return None, Exception("не открылась")
+        return [FakeTrack("превью", "soundcloud", 30_000), FakeTrack("по названию")], None
+
+    real = playback.search_with_node_fallback
+    playback.search_with_node_fallback = fake_search
+    try:
+        run = lambda title, uri: asyncio.run(playback.load_saved_track(title, uri, "dzsearch"))
+        got = run("Song", "https://www.deezer.com/track/1")
+        assert got.title == "по ссылке" and calls == ["https://www.deezer.com/track/1"], \
+            f"рабочая ссылка: {got}, запросы {calls}"
+        calls.clear()
+        got = run("Song", "https://www.youtube.com/watch?v=x")
+        assert got.title == "по названию" and calls == ["Song"], \
+            f"ссылку на YouTube надо пропускать: {got}, запросы {calls}"
+        calls.clear()
+        got = run("Song", "https://soundcloud.com/a/b")
+        assert got.title == "по названию" and calls == ["https://soundcloud.com/a/b", "Song"], \
+            f"неоткрывшаяся ссылка → поиск по названию: {got}, запросы {calls}"
+        calls.clear()
+        assert run("", "") is None and calls == [], f"пустая запись: запросы {calls}"
+    finally:
+        playback.search_with_node_fallback = real
+
+
 def test_format_duration():
     assert helpers.format_duration(0) == "0:00"
     assert helpers.format_duration(65_000) == "1:05"

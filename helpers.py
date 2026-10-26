@@ -152,7 +152,9 @@ async def add_tracks_fairly(
     player.queue.clear()
     for tr in new_queue:
         await player.queue.put_wait(tr)
-    cleanup_track_map(guild_id, new_queue)
+    # Метку играющего трека тоже храним: статистика пишется, когда он доиграет
+    current = getattr(player, "current", None)
+    cleanup_track_map(guild_id, new_queue + ([current] if current else []))
 
 
 async def get_fair_queue_enabled(guild_id: int) -> bool:

@@ -45,17 +45,7 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
 
     is_birthday_track = (track is not None
                          and state.get("birthday_track") == track.encoded)
-
-    add_to_history(guild.id, track)
-
-    if core.db_pool:
-        try:
-            await db_increment_stats(guild.id, track.length)
-            owner = get_track_owner(guild.id, track)
-            if owner:
-                await db_increment_user_stats(owner, track.length, getattr(track, "author", "") or "")
-        except Exception as e:
-            log.warning("Stats increment error: %s", e)
+    # История и статистика пишутся в track_end — только для сыгранных треков
 
     channel_id = state.get("text_channel_id")
     channel = guild.get_channel(channel_id) if channel_id else None
@@ -104,6 +94,9 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         return
     if reason in ("finished", "stopped"):
         state["consec_fails"] = 0
+        # Трек реально играл (доиграл или его пропустили) — в историю и
+        # статистику. Упавшие сюда не доходят: их забирает fail_owned выше.
+        await _record_played(guild, payload.track)
 
     channel_id = state.get("text_channel_id")
     channel = guild.get_channel(channel_id) if channel_id else None
@@ -157,6 +150,21 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
             pass
 
     await _play_next(player, guild, state, channel)
+
+
+async def _record_played(guild: discord.Guild, track):
+    if track is None:
+        return
+    add_to_history(guild.id, track)
+    if not core.db_pool:
+        return
+    try:
+        await db_increment_stats(guild.id, track.length)
+        owner = get_track_owner(guild.id, track)
+        if owner:
+            await db_increment_user_stats(owner, track.length, getattr(track, "author", "") or "")
+    except Exception as e:
+        log.warning("Stats increment error: %s", e)
 
 
 async def _play_next(player: wavelink.Player, guild: discord.Guild,

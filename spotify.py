@@ -55,30 +55,6 @@ async def get_spotify_token() -> Optional[str]:
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning("Spotify auth error: %s", e)
         return None
-    if _spotify_token and time.time() < _spotify_token_expires:
-        return _spotify_token
-    creds = base64.b64encode(
-        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
-    ).decode()
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as s:
-            async with s.post(
-                "https://accounts.spotify.com/api/token",
-                headers={"Authorization": f"Basic {creds}"},
-                data={"grant_type": "client_credentials"},
-            ) as resp:
-                if resp.status != 200:
-                    log.warning("Spotify auth failed: %s", resp.status)
-                    return None
-                data = await resp.json()
-                _spotify_token = data["access_token"]
-                _spotify_token_expires = time.time() + data["expires_in"] - 60
-                return _spotify_token
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        log.warning("Spotify auth error: %s", e)
-        return None
 
 
 def parse_spotify_url(url: str) -> Optional[tuple]:

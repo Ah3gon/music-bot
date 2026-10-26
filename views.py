@@ -894,9 +894,9 @@ PANEL_CHOICES = {
     ),
     "default_search_source": (
         "panel.o_source",
-        ["deezer", "soundcloud", "youtube", "yandex"],
-        {"deezer": "Deezer", "soundcloud": "SoundCloud",
-         "youtube": "YouTube", "yandex": "Yandex Music"},
+        # Яндекса нет: выключен в Lavalink, поиск через него всегда пустой
+        ["deezer", "soundcloud", "youtube"],
+        {"deezer": "Deezer", "soundcloud": "SoundCloud", "youtube": "YouTube"},
     ),
 }
 PANEL_MAIN = ["vote_skip_enabled", "fair_queue", "announce_now_playing", "default_volume", "default_search_source", "language"]

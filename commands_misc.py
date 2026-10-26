@@ -19,7 +19,7 @@ from core import *
 
 from database import db_add_follow, db_add_server_track, db_add_track, db_create_playlist, db_create_server_playlist, db_delete_follow, db_delete_playlist, db_delete_server_playlist, db_get_birthday, db_get_follow, db_get_playlist, db_get_playlist_by_share_code, db_get_server_playlist, db_get_server_playlists, db_get_server_tracks, db_get_settings, db_get_tracks, db_get_user_follows, db_get_user_playlists, db_save_settings, db_set_birthday, db_set_share_code
 from helpers import add_tracks_fairly, check_track_limit, format_duration, get_fair_queue_enabled, increment_user_track_count, is_dj, tag_track
-from playback import detect_source_from_url, ensure_voice_connection, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
+from playback import detect_source_from_url, ensure_voice_connection, guild_search_source, load_saved_track, safe_play_track, search_many_youtube, search_source_for, search_with_node_fallback
 from views import PlaylistEditView, SettingsPanelView
 from spotify import fetch_spotify_with_fallback, parse_spotify_url
 
@@ -235,12 +235,10 @@ async def pl_play(interaction: discord.Interaction, name: str):
 
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
     loaded = []
+    source = await guild_search_source(interaction.guild_id)
     for t in tracks[:PLAYLIST_TRACK_LIMIT]:
-        results, _ = await search_with_node_fallback(
-            t["uri"], wavelink.TrackSource.YouTube
-        )
-        if results:
-            track = results[0] if isinstance(results, list) else results.tracks[0]
+        track = await load_saved_track(t["title"], t["uri"], source)
+        if track is not None:
             loaded.append(track)
 
     if not loaded:
@@ -263,7 +261,9 @@ async def pl_play(interaction: discord.Interaction, name: str):
         await safe_play_track(player, first)
     else:
         await add_tracks_fairly(player, loaded, interaction.user.id, enabled=fair)
-        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`")
+        missed = min(len(tracks), PLAYLIST_TRACK_LIMIT) - len(loaded)
+        note = f" (не нашлось: {missed})" if missed else ""
+        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`{note}")
     increment_user_track_count(interaction.guild_id, interaction.user.id, len(loaded))
 
 
@@ -348,7 +348,7 @@ async def pl_tracks(interaction: discord.Interaction, name: str):
 
 
 @playlist_group.command(name="import", description="Импортировать плейлист по ссылке в свой плейлист")
-@app_commands.describe(url="Ссылка (YouTube / Spotify / Яндекс / SoundCloud)", name="Название плейлиста в боте")
+@app_commands.describe(url="Ссылка (Deezer / Spotify / SoundCloud)", name="Название плейлиста в боте")
 async def pl_import(interaction: discord.Interaction, url: str, name: str):
     if not core.db_pool:
         await interaction.response.send_message("❗ База данных недоступна.", ephemeral=True)
@@ -411,7 +411,7 @@ async def pl_import(interaction: discord.Interaction, url: str, name: str):
         await msg.edit(content=f"✅ Импортировано в **{clean}**: `{added}` треков из Spotify.{note}")
         return
 
-    # ---- YouTube / Яндекс / SoundCloud: грузим через Lavalink напрямую ----
+    # ---- Deezer / SoundCloud: грузим через Lavalink напрямую ----
     source = detect_source_from_url(url)
     msg = await interaction.followup.send("⏳ Загружаю плейлист...", ephemeral=True, wait=True)
     results, err = await search_with_node_fallback(url, source)
@@ -821,10 +821,10 @@ async def spl_play(interaction: discord.Interaction, name: str):
         return
     msg = await interaction.followup.send(f"⏳ Загружаю **{clean}**...", wait=True)
     loaded = []
+    source = await guild_search_source(interaction.guild_id)
     for t in tracks[:PLAYLIST_TRACK_LIMIT]:
-        results, _ = await search_with_node_fallback(t["uri"], wavelink.TrackSource.YouTube)
-        if results:
-            track = results[0] if isinstance(results, list) else results.tracks[0]
+        track = await load_saved_track(t["title"], t["uri"], source)
+        if track is not None:
             loaded.append(track)
     if not loaded:
         await msg.edit(content=f"😕 Не удалось загрузить треки из **{clean}**.")
@@ -845,7 +845,9 @@ async def spl_play(interaction: discord.Interaction, name: str):
         await safe_play_track(player, first)
     else:
         await add_tracks_fairly(player, loaded, interaction.user.id, enabled=fair)
-        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`")
+        missed = min(len(tracks), PLAYLIST_TRACK_LIMIT) - len(loaded)
+        note = f" (не нашлось: {missed})" if missed else ""
+        await msg.edit(content=f"📋 **{clean}** добавлен — `{len(loaded)} треков`{note}")
     increment_user_track_count(interaction.guild_id, interaction.user.id, len(loaded))
 
 
@@ -924,7 +926,7 @@ tree.add_command(birthday_group)
 #  Help
 # ─────────────────────────────────────────────
 HELP_CATEGORIES = {
-    "play": ("▶️", "Воспроизведение", """`/play <запрос/ссылка>` — YouTube, SoundCloud, Spotify, Яндекс
+    "play": ("▶️", "Воспроизведение", """`/play <запрос/ссылка>` — Deezer, SoundCloud, Spotify
 `/skip` — пропустить (или голосование за скип)
 `/skipto <номер>` — перейти к треку очереди
 `/forward <сек>` / `/rewind <сек>` — перемотка

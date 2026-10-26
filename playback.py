@@ -302,18 +302,48 @@ async def search_many_youtube(queries: list, batch_size: int = 5, source=None) -
     return found
 
 
+def _first_track(results):
+    if not results:
+        return None
+    if isinstance(results, list):
+        return results[0] if results else None
+    tracks = getattr(results, "tracks", None)
+    return tracks[0] if tracks else None
+
+
+async def load_saved_track(title: str, uri: str, source):
+    """Трек из сохранённого плейлиста: по ссылке, а если ссылки нет, она на
+    YouTube (с сервера не работает) или не открылась — поиском по названию
+    в источнике сервера. Иначе старые плейлисты молча теряли треки."""
+    uri = (uri or "").strip()
+    if uri and "youtube.com" not in uri and "youtu.be" not in uri:
+        results, _ = await search_with_node_fallback(uri, source)
+        track = _first_track(results)
+        if track is not None:
+            return track
+    if title:
+        results, _ = await search_with_node_fallback(title, source)
+        if results:
+            found = results if isinstance(results, list) else (getattr(results, "tracks", None) or [])
+            return pick_full_track(found)
+    return None
+
+
+# Резервные источники для автоподмены, по порядку. Яндекса нет: он выключен
+# в Lavalink (нужен российский IP), и каждый запрос к нему впустую ждал ошибку.
+ALT_SOURCES = [("deezer", "dzsearch"),
+               ("soundcloud", wavelink.TrackSource.SoundCloud)]
+
+
 async def find_alternative_track(title: str, author: str = "", exclude_source: str = ""):
-    """Ищет тот же трек на резервных источниках (SoundCloud, затем Яндекс).
-    Возвращает трек или None. Нужен, когда основной источник (YouTube) недоступен."""
+    """Ищет тот же трек на резервных источниках (ALT_SOURCES), пропуская тот,
+    на котором трек упал. Возвращает трек или None."""
     query = f"{author} - {title}" if author else title
     query = query.strip()
     if not query:
         return None
     ex = (exclude_source or "").lower()
-    chain = [("deezer", "dzsearch"),
-             ("soundcloud", wavelink.TrackSource.SoundCloud),
-             ("yandexmusic", "ymsearch")]
-    for src_name, src in chain:
+    for src_name, src in ALT_SOURCES:
         if ex and ex in src_name:
             continue
         try:

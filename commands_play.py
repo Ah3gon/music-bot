@@ -24,7 +24,7 @@ from views import TrackSelectView
 #  Slash-команды: воспроизведение
 # ─────────────────────────────────────────────
 @tree.command(name="play", description="Поиск трека или добавление плейлиста")
-@app_commands.describe(query="Название, ссылка YouTube/SoundCloud/Spotify или плейлист")
+@app_commands.describe(query="Название, ссылка Deezer/SoundCloud/Spotify или плейлист")
 async def play_cmd(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     if not interaction.user.voice:
@@ -194,7 +194,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
                 err_msg = (
                     "❌ **Spotify токен недействителен.**\n"
                     "_Администратору: проверь SPOTIFY_CLIENT_ID и "
-                    "SPOTIFY_CLIENT_SECRET в Railway._"
+                    "SPOTIFY_CLIENT_SECRET в .env на сервере._"
                 )
             elif sp_error == "spotify_network_error":
                 err_msg = (

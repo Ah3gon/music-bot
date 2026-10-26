@@ -33,10 +33,13 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     guild = player.guild
     cancel_idle_timer(guild.id)
     state = get_player_state(guild.id)
-    state["consec_fails"] = 0
+    # consec_fails здесь НЕ сбрасываем: упавший трек сначала стартует, потом
+    # падает. Сброс — в track_end, когда трек доиграл или его пропустили.
     # Счётчик подмен сбрасываем только когда заиграл ДРУГОЙ трек:
-    # подменённая версия имеет то же название и стартует перед падением.
-    if state.get("fallback_title") != track.title:
+    # подменённая версия имеет то же название и стартует перед падением,
+    # а найденную замену (название часто другое) узнаём по fallback_alt.
+    is_alt = state.pop("fallback_alt", None) == track.encoded
+    if not is_alt and state.get("fallback_title") != track.title:
         state["fallback_tries"] = 0
         state.pop("fallback_title", None)
 
@@ -84,6 +87,23 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         return
     guild = player.guild
     state = get_player_state(guild.id)
+    reason = str(getattr(payload, "reason", "") or "").lower()
+    # replaced — трек перебит новым play(), очередь двигать нельзя;
+    # cleanup — плеер уничтожен.
+    if reason in ("replaced", "cleanup"):
+        return
+    # Трек упал: очередь продвигает on_wavelink_track_exception (он приходит
+    # раньше и может ещё искать замену). Иначе оба обработчика запускают
+    # по треку и перебивают друг друга, съедая очередь.
+    owned = state.get("fail_owned")
+    if (owned and payload.track is not None
+            and owned[0] == payload.track.encoded
+            and time.monotonic() - owned[1] < 30):
+        state.pop("fail_owned", None)
+        return
+    if reason in ("finished", "stopped"):
+        state["consec_fails"] = 0
+
     channel_id = state.get("text_channel_id")
     channel = guild.get_channel(channel_id) if channel_id else None
 
@@ -125,6 +145,12 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         except Exception:
             pass
 
+    await _play_next(player, guild, state, channel)
+
+
+async def _play_next(player: wavelink.Player, guild: discord.Guild,
+                     state: dict, channel):
+    """Запускает следующий трек очереди (с предохранителем) или idle-таймер."""
     if state.get("consec_fails", 0) >= 4 and not player.queue.is_empty:
         dropped = len(player.queue)
         player.queue.clear()
@@ -200,11 +226,22 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
                 track.title if track else "?")
     guild = player.guild
     state = get_player_state(guild.id)
+    channel_id = state.get("text_channel_id")
+    channel = guild.get_channel(channel_id) if channel_id else None
+
+    if track is None:
+        state["consec_fails"] = state.get("consec_fails", 0) + 1
+        return  # не знаем, какой трек упал — очередь продвинет track_end
+
+    # Продвижение очереди берём на себя — track_end этого трека пропустит.
+    # Ставим метку до первого await, чтобы track_end её точно увидел.
+    # В режиме повтора упавший трек тоже не перезапускаем — иначе вечный цикл.
+    state["fail_owned"] = (track.encoded, time.monotonic())
 
     # Источник недоступен (частая беда с YouTube) — ищем тот же трек
     # на резервных источниках и играем его вместо упавшего.
     tried = state.get("fallback_tries", 0)
-    if track and not state.get("fallback_in_progress") and tried < 2:
+    if not state.get("fallback_in_progress") and tried < 2:
         state["fallback_tries"] = tried + 1
         state["fallback_title"] = track.title
         state["fallback_in_progress"] = True
@@ -217,15 +254,16 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
             log.warning("Поиск замены не удался: %s", e)
         finally:
             state["fallback_in_progress"] = False
+        if _other_track_started(player, track):
+            return  # пока искали, кто-то включил другой трек — не перебиваем
         if alt is not None:
             log.info("Замена источника: '%s' → '%s'", track.title, alt.title)
             owner = get_track_owner(guild.id, track)
             if owner:
                 tag_track(guild.id, alt, owner)
             state["source_swapped"] = True
+            state["fallback_alt"] = alt.encoded
             if await safe_play_track(player, alt):
-                channel_id = state.get("text_channel_id")
-                channel = guild.get_channel(channel_id) if channel_id else None
                 if channel:
                     try:
                         await channel.send(
@@ -234,9 +272,18 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
                     except discord.HTTPException:
                         pass
                 return
+            state.pop("fallback_alt", None)
 
     state["consec_fails"] = state.get("consec_fails", 0) + 1
-    # Очередь продвигает track_end (Lavalink шлёт его следом за exception).
+    if _other_track_started(player, track):
+        return
+    await _play_next(player, guild, state, channel)
+
+
+def _other_track_started(player: wavelink.Player, failed) -> bool:
+    """Играет уже не упавший трек, а какой-то другой (например, новый /play)."""
+    cur = player.current
+    return cur is not None and cur.encoded != failed.encoded
 
 
 @bot.event
@@ -422,13 +469,15 @@ async def on_voice_state_update(member: discord.Member,
             await asyncio.sleep(empty)
         except asyncio.CancelledError:
             return
+        # Снимаем себя из словаря ДО full_disconnect: иначе он через
+        # cancel_empty_channel_timer отменит эту же задачу и оборвёт отключение.
+        if empty_channel_tasks.get(guild.id) is asyncio.current_task():
+            empty_channel_tasks.pop(guild.id, None)
         p: wavelink.Player = guild.voice_client
         if not p or not p.connected or not p.channel:
-            empty_channel_tasks.pop(guild.id, None)
             return
         current_non_bots = [m for m in p.channel.members if not m.bot]
         if len(current_non_bots) > 0:
-            empty_channel_tasks.pop(guild.id, None)
             return
         state = get_player_state(guild.id)
         channel_id = state.get("text_channel_id")
@@ -440,7 +489,6 @@ async def on_voice_state_update(member: discord.Member,
                     await ch.send("👋 Все ушли — выхожу из канала.")
                 except discord.HTTPException:
                     pass
-        empty_channel_tasks.pop(guild.id, None)
 
     empty_channel_tasks[member.guild.id] = asyncio.create_task(_empty_timer(member.guild))
 

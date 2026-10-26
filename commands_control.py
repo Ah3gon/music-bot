@@ -257,15 +257,18 @@ async def lyrics_cmd(interaction: discord.Interaction):
         )
         return
 
-    text = result["text"]
-    if len(text) > LYRICS_MAX_CHARS:
-        text = text[:LYRICS_MAX_CHARS] + t(interaction.guild_id, "lyrics.truncated")
-
     synced_mark = " 🎤" if result.get("synced") else ""
-    await interaction.followup.send(
-        t(interaction.guild_id, "lyrics.header", title=title,
-          source=result["source"], synced=synced_mark) + "\n\n" + text
-    )
+    header = t(interaction.guild_id, "lyrics.header", title=title,
+               source=result["source"], synced=synced_mark) + "\n\n"
+    truncated = t(interaction.guild_id, "lyrics.truncated")
+    # Обычное сообщение — максимум 2000 символов, описание embed — 4096
+    limit = min(LYRICS_MAX_CHARS, 4096 - len(header) - len(truncated))
+    text = result["text"]
+    if len(text) > limit:
+        text = text[:limit] + truncated
+
+    embed = discord.Embed(description=header + text, color=BRAND_COLOR)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="history", description="История последних треков")

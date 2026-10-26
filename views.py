@@ -222,7 +222,7 @@ class QueuePaginationView(discord.ui.View):
             cur = f"[{tr.title}]({tr.uri})" if tr.uri else tr.title
             embed.add_field(
                 name=t(self.guild.id, "queue.now"),
-                value=f"**{cur}** `[{format_duration(t.length)}]`",
+                value=f"**{cur}** `[{format_duration(tr.length)}]`",
                 inline=False,
             )
 
@@ -794,7 +794,7 @@ class PlaylistEditView(discord.ui.View):
         if not tr:
             return
         await interaction.response.defer()
-        results, _ = await search_with_node_fallback(t["title"], wavelink.TrackSource.YouTube)
+        results, _ = await search_with_node_fallback(tr["title"], wavelink.TrackSource.YouTube)
         if results:
             if isinstance(results, wavelink.Playlist):
                 cand = results.tracks[:5]
@@ -807,7 +807,7 @@ class PlaylistEditView(discord.ui.View):
         if not cand:
             await interaction.followup.send(t(interaction.guild_id, "edit.no_versions"), ephemeral=True)
             return
-        vview = VersionSelectView(self, t, cand)
+        vview = VersionSelectView(self, tr, cand)
         await interaction.edit_original_response(
             content=t(interaction.guild_id, "edit.pick_version", p0=tr['title']), view=vview)
 
@@ -899,7 +899,7 @@ class SettingValueModal(discord.ui.Modal):
         self.key = key
         self.lo, self.hi = lo, hi
         self.field = discord.ui.TextInput(
-            label=t(self.guild.id, "panel.number_range", p0=lo, p1=hi), required=True, max_length=6)
+            label=t(panel.guild.id, "panel.number_range", p0=lo, p1=hi), required=True, max_length=6)
         self.add_item(self.field)
 
     async def on_submit(self, interaction: discord.Interaction):
